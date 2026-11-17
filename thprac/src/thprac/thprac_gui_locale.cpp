@@ -113,6 +113,7 @@ static ImWchar baseUnicodeRanges[] =
 	0xFF00, 0xFFEF, // Half-width characters
 	0x2190, 0x2199, // arrows
 	0x0391, 0x03C9, // greece chars
+	0x6B20, 0x6B20, // U+6B20 (qian), used by the hard-coded TH15 "traditional no-death mode" label
 };
 static const ImWchar __thprac_loc_range_ChineseFull[] = {
     0x0020, 0x00FF, // Basic Latin + Latin Supplement

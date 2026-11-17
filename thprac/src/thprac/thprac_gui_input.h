@@ -18,6 +18,7 @@ namespace THPrac
 
 		// Keyboard Input
 		int  KeyboardInputUpdate(int v_key);
+		void KeyboardInputUseWindowMessages();
 		void KeyboardInputUpdate();
 		template<class... Args>
 		int  KeyboardInputUpdate(int key, Args... rest);

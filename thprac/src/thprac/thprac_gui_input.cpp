@@ -140,8 +140,19 @@ namespace THPrac
 		/***                   Keyboard Input                     ***/
 
 		static uint8_t __ki_keystatus[0xFF]{};
+		static bool keyboardUsesWindowMessages = false;
+
+		void KeyboardInputUseWindowMessages()
+		{
+			keyboardUsesWindowMessages = true;
+		}
+
 		int KeyboardInputUpdate(int v_key)
 		{
+			if (keyboardUsesWindowMessages) {
+				const int frames = ImplWin32CheckForeground() ? ImplWin32GetKeyFrame(v_key) : 0;
+				return __ki_keystatus[v_key] = static_cast<uint8_t>(frames < 255 ? frames : 255);
+			}
 			if (ImplWin32CheckForeground() && GetAsyncKeyState(v_key) < 0)
 			{
 				if (__ki_keystatus[v_key] != 0xff)
@@ -166,6 +177,8 @@ namespace THPrac
 		}
 		bool KeyboardInputGetRaw(int v_key)
 		{
+			if (keyboardUsesWindowMessages)
+				return ImplWin32CheckForeground() && ImplWin32GetKey(v_key) != 0;
 			return (ImplWin32CheckForeground()) ? (GetAsyncKeyState(v_key) < 0) : false;
 		}
 

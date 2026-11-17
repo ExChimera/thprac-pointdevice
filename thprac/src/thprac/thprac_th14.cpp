@@ -1,9 +1,19 @@
 ﻿#include "thprac_games.h"
 #include "thprac_utils.h"
+#include "../../resource.h"
+#include <array>
+#include <algorithm>
+#include <cmath>
+#include <cstring>
+#include <span>
 #include <list>
 #include <format>
 #include <d3d9.h>
+#include <dinput.h>
+#include <imm.h>
+#include <wrl/client.h>
 
+EXTERN_C IMAGE_DOS_HEADER __ImageBase;
 
 namespace THPrac {
 namespace TH14 {
@@ -11,14 +21,68 @@ namespace TH14 {
     enum addrs {
         BOMB_PTR = 0x4DB52C,
         ENEMY_MANAGER_PTR = 0x4db544,
+        ITEM_MANAGER_PTR = 0x4db660,
         CHARA_ADDR = 0x4f5828,
         SUBSHOT_ADDR = 0x4f582c,
+        BONUS_TOTAL = 0x4f5894,
         PLAYER_PTR = 0x4db67c,
         STAGE_NUM = 0x4f58a4,
+        SUPERVISOR_NEXT_STATE = 0x4d964c,
         WINDOW_PTR = 0x4f5a18,
     };
     int g_lock_timer = 0;
     bool g_lock_timer_flag = false;
+    static bool pointdeviceEnabled = false;
+    static bool pointdeviceRun = false;
+    static bool pointdeviceLocked = false;
+    static bool pointdeviceKeyHookInstalled = false;
+
+    static constexpr int lifeFragmentItem = 4, bombFragmentItem = 6, cycleRewardItem = 12;
+    using SpawnItem = uintptr_t(__thiscall*)(uintptr_t, int, const float*, uint32_t, float, float, int);
+    static const auto spawnItem = reinterpret_cast<SpawnItem>(0x4397b0);
+
+    namespace Pointdevice {
+        static bool IgnoreRetryKey(WPARAM key);
+    }
+
+    struct ChapterCounts {
+        int32_t bonus05;
+        int32_t bonus08;
+        int32_t bonus12;
+        int32_t bonus16;
+        int32_t bonus20;
+        int32_t bombsUsed;
+    };
+    static ChapterCounts chapterCounts {};
+
+    static LRESULT CALLBACK PointdeviceKeyHook(int code, WPARAM action, LPARAM data)
+    {
+        if (code == HC_ACTION && action == PM_REMOVE) {
+            auto& message = *reinterpret_cast<MSG*>(data);
+            const auto gameWindow = GetMemContent<HWND>(WINDOW_PTR);
+            constexpr LPARAM wasDown = 1L << 30;
+            if ((message.message == WM_KEYDOWN || message.message == WM_SYSKEYDOWN)
+                && message.hwnd == gameWindow && Pointdevice::IgnoreRetryKey(message.wParam)) {
+                message.message = WM_NULL;
+            }
+            if (message.message == WM_KEYDOWN && !(message.lParam & wasDown)
+                && !pointdeviceLocked && message.hwnd == gameWindow && GetForegroundWindow() == gameWindow) {
+                // Recover IME-processed keys while the original virtual key is
+                // still available, before the game calls TranslateMessage.
+                auto key = message.wParam;
+                if (key == VK_PROCESSKEY) {
+                    key = ImmGetVirtualKey(message.hwnd);
+                    if (key == VK_PROCESSKEY) {
+                        const auto scanCode = (message.lParam >> 16) & 0xff;
+                        key = MapVirtualKeyW(scanCode, MAPVK_VSC_TO_VK);
+                    }
+                }
+                if (key == 'P')
+                    pointdeviceEnabled = !pointdeviceEnabled;
+            }
+        }
+        return CallNextHookEx(nullptr, code, action, data);
+    }
     
     using std::pair;
     struct THPracParam {
@@ -38,7 +102,6 @@ namespace TH14 {
         int32_t graze;
 
         int32_t faketype;
-        float st6bs8_phase;
 
         bool dlg;
         bool keepSpellDrops;
@@ -70,7 +133,6 @@ namespace TH14 {
             GetJsonValue(value);
             GetJsonValue(graze);
             GetJsonValue(faketype);
-            GetJsonValue(st6bs8_phase);
 
             return true;
         }
@@ -102,7 +164,6 @@ namespace TH14 {
                 AddJsonValue(value);
                 AddJsonValue(graze);
                 AddJsonValue(faketype);
-                AddJsonValue(st6bs8_phase);
 
                 ReturnJson();
             } else if (mode == 2) {
@@ -177,7 +238,6 @@ namespace TH14 {
                 thPracParam.value = *mValue;
                 thPracParam.graze = *mGraze;
                 thPracParam.faketype = *mFakeType;
-                thPracParam.st6bs8_phase = *mST6BS8_Custom;
                 break;
             case 4:
                 Close();
@@ -235,8 +295,6 @@ namespace TH14 {
                 return TH14_SPELL_5PHASE;
             } else if (section == TH14_ST3_MID2_HL){
                 return TH_TIMEOUT_SETTING;
-            } else if (section == TH14_ST6_BOSS8) {
-                return TH_MODE_SELECT;
             }
             return nullptr;
         }
@@ -395,9 +453,6 @@ namespace TH14 {
                     mDlg();
                 mPhase(TH_PHASE, SpellPhase());
 
-                if (sections[*mSection] == TH14_ST6_BOSS8 && *mPhase) {
-                    mST6BS8_Custom();
-                }
                 if (SectionHasSpellDrops(sections[*mSection]))
                     mKeepSpellDrops();
                 break;
@@ -424,9 +479,6 @@ namespace TH14 {
         Gui::GuiSlider<int, ImGuiDataType_S32> mBomb { TH_BOMB, 0, 8 };
         Gui::GuiSlider<int, ImGuiDataType_S32> mBombFragment { TH_BOMB_FRAGMENT, 0, 7 };
         Gui::GuiSlider<int, ImGuiDataType_S32> mPower { TH_POWER, 100, 400 };
-
-        Gui::GuiSlider<float, ImGuiDataType_Float> mST6BS8_Custom { TH_BT_PHASE, -1.0f, 1.0f};
-
         Gui::GuiDrag<int, ImGuiDataType_S32> mValue { TH_VALUE, 0, 999990, 10, 100000 };
         Gui::GuiDrag<int, ImGuiDataType_S32> mGraze { TH_GRAZE, 0, 999999, 1, 100000 };
 
@@ -558,9 +610,21 @@ namespace TH14 {
             mElBgm();
             mInGameInfo();
             mEnemyMuteki();
+            const bool enabled = pointdeviceLocked ? pointdeviceRun : pointdeviceEnabled;
+            ImVec4 color = { 1.0f, 1.0f, 1.0f, 1.0f };
+            if (pointdeviceLocked)
+                color = { 1.0f, 0.3f, 0.3f, 1.0f };
+            else if (enabled)
+                color = Gui::GuiHotKey::EnabledTextColor();
+            ImGui::PushFont(ImGui::GetIO().Fonts->Fonts[Gui::LOCALE_ZH_CN]);
+            ImGui::TextColored(color, "%s", enabled ? "[P：无欠模式] " : "P：无欠模式");
+            ImGui::PopFont();
         }
         virtual void OnPreUpdate() override
         {
+            if (!pointdeviceKeyHookInstalled && Gui::KeyboardInputUpdate('P') == 1 && !pointdeviceLocked)
+                pointdeviceEnabled = !pointdeviceEnabled;
+
             if (mMenu(false) && !ImGui::IsAnyItemActive()) {
                 if (*mMenu) {
                     Open();
@@ -644,12 +708,27 @@ namespace TH14 {
         }
     public:
         int32_t mMissCount;
-        int32_t mBombCount;
-        int32_t m05Count;
-        int32_t m08Count;
-        int32_t m12Count;
-        int32_t m16Count;
-        int32_t m20Count;
+
+        void OnRestart()
+        {
+            if (pointdeviceRun) {
+                ++mRetryCount;
+                mRestarting = true;
+            }
+        }
+
+        void OnGameStart()
+        {
+            mMissCount = 0;
+            if (!pointdeviceRun || !mRestarting)
+                mRetryCount = 0;
+            chapterCounts = {};
+            mRestarting = false;
+        }
+
+    private:
+        int32_t mRetryCount = 0;
+        bool mRestarting = false;
 
     protected:
         virtual void OnLocaleChange() override
@@ -689,7 +768,8 @@ namespace TH14 {
             ImGui::Columns(2);
             float bonus_cnt_space = 0.0f;
             if (g_adv_igi_options.th14_showBonus){
-                std::string bonus_cnt = std::format("{}/{}/{}/{}", m05Count, m08Count, m12Count, m16Count);
+                std::string bonus_cnt = std::format("{}/{}/{}/{}", chapterCounts.bonus05,
+                    chapterCounts.bonus08, chapterCounts.bonus12, chapterCounts.bonus16);
                 float bonus_cnt_sz = ImGui::CalcTextSize(bonus_cnt.c_str()).x;
                 std::string cycle_cnt = S(THPRAC_INGAMEINFO_TH14_BONUS_BOMB);
                 cycle_cnt += ' ';
@@ -707,13 +787,13 @@ namespace TH14 {
             
 
 
-            ImGui::Text(S(THPRAC_INGAMEINFO_MISS_COUNT));
+            ImGui::TextUnformatted(pointdeviceRun ? "retry:" : S(THPRAC_INGAMEINFO_MISS_COUNT));
             ImGui::NextColumn();
-            ImGui::Text("%8d", mMissCount);
+            ImGui::Text("%8d", pointdeviceRun ? mRetryCount : mMissCount);
             ImGui::NextColumn();
             ImGui::Text(S(THPRAC_INGAMEINFO_BOMB_COUNT));
             ImGui::NextColumn();
-            ImGui::Text("%8d", mBombCount);
+            ImGui::Text("%8d", chapterCounts.bombsUsed);
             if (g_adv_igi_options.th14_showItemsCount)
             {
                 int n = 0;
@@ -741,36 +821,39 @@ namespace TH14 {
                 ImGui::NextColumn();
                 ImGui::SetCursorPosX(ImGui::GetCursorPosX() + bonus_cnt_space);
 
-                ImGui::TextColored({ 0.6f, 0.90f, 1.0f, 1.0f }, "%d", m05Count);
+                ImGui::TextColored({ 0.6f, 0.90f, 1.0f, 1.0f }, "%d", chapterCounts.bonus05);
                 ImGui::SameLine(0.0f, 0.0f);
                 ImGui::Text("/");
                 ImGui::SameLine(0.0f, 0.0f);
-                ImGui::TextColored({ 0.8f, 1.0f, 0.8f, 1.0f }, "%d", m08Count);
+                ImGui::TextColored({ 0.8f, 1.0f, 0.8f, 1.0f }, "%d", chapterCounts.bonus08);
                 ImGui::SameLine(0.0f, 0.0f);
                 ImGui::Text("/");
                 ImGui::SameLine(0.0f, 0.0f);
-                ImGui::TextColored({ 0.7f, 0.9f, 0.40f, 1.0f }, "%d", m12Count);
+                ImGui::TextColored({ 0.7f, 0.9f, 0.40f, 1.0f }, "%d", chapterCounts.bonus12);
                 ImGui::SameLine(0.0f, 0.0f);
                 ImGui::Text("/");
                 ImGui::SameLine(0.0f, 0.0f);
-                ImGui::TextColored({ 1.0f, 0.85f, 0.5f, 1.0f }, "%d", m16Count);
+                ImGui::TextColored({ 1.0f, 0.85f, 0.5f, 1.0f }, "%d", chapterCounts.bonus16);
 
                 ImGui::NextColumn();
                 ImGui::Text(S(THPRAC_INGAMEINFO_TH14_BONUS_20));
                 ImGui::NextColumn();
-                ImGui::TextColored({ 1.0f, 0.95f, 0.5f, 1.0f }, "%8d", m20Count);
+                ImGui::TextColored({ 1.0f, 0.95f, 0.5f, 1.0f }, "%8d", chapterCounts.bonus20);
                 ImGui::NextColumn();
 
                 ImGui::Text(S(THPRAC_INGAMEINFO_TH14_BONUS_TOTAL));
                 ImGui::NextColumn();
-                ImGui::Text("%8d", *(DWORD*)(0x4F5894));
+                ImGui::Text("%8d", GetMemContent<int>(BONUS_TOTAL));
                 ImGui::NextColumn();
 
-                ImGui::Text(S(THPRAC_INGAMEINFO_TH14_EXTEND_COUNT));
-                ImGui::NextColumn();
-                ImGui::TextColored((*(DWORD*)(0x4F586C) >= 49) ? ImVec4(0.5f, 0.5f, 0.5f, 1.0f) : ImVec4(1.0f, 1.0f, 1.0f, 1.0f)
-                                 , "%8d", *(DWORD*)(0x4F586C));
-                ImGui::NextColumn();
+                if (!pointdeviceRun) {
+                    const int extends = GetMemContent<int>(0x4f586c);
+                    ImGui::Text(S(THPRAC_INGAMEINFO_TH14_EXTEND_COUNT));
+                    ImGui::NextColumn();
+                    ImGui::TextColored(extends >= 49 ? ImVec4(0.5f, 0.5f, 0.5f, 1.0f) : ImVec4(1.0f, 1.0f, 1.0f, 1.0f),
+                        "%8d", extends);
+                    ImGui::NextColumn();
+                }
 
                 ImGui::Text(S(THPRAC_INGAMEINFO_TH14_BONUS_NEXT));
                 ImGui::NextColumn();
@@ -779,12 +862,29 @@ namespace TH14 {
 
                 const ImVec4 color_life_next = { 1.0f, 0.6f, 0.6f, 1.0f };
                 const ImVec4 color_bomb_next = { 0.5f, 1.0f, 0.5f, 1.0f };
-                int cycle = *(DWORD*)(0x4F5894) % 5;
+                const int cycle = GetMemContent<int>(BONUS_TOTAL) % 5;
+                const char* bombLabel = S(THPRAC_INGAMEINFO_TH14_BONUS_BOMB);
+                const char* lifeLabel = S(THPRAC_INGAMEINFO_TH14_BONUS_LIFE);
                 for (int i = 0; i < 4; i++){
-                    ImGui::TextColored(cycle == i ? color_bomb_next:color_bomb, "%s ", S(THPRAC_INGAMEINFO_TH14_BONUS_BOMB));
+                    ImGui::TextColored(cycle == i ? color_bomb_next:color_bomb, "%s ", bombLabel);
                     ImGui::SameLine(0.0f, 0.0f);
                 }
-                ImGui::TextColored(cycle == 4 ? color_life_next : color_life, "%s", S(THPRAC_INGAMEINFO_TH14_BONUS_LIFE));
+                if (pointdeviceRun) {
+                    const auto& color = cycle == 4 ? color_bomb_next : color_bomb;
+                    const auto position = ImGui::GetCursorScreenPos();
+                    const auto lifeSize = ImGui::CalcTextSize(lifeLabel);
+                    const auto bombSize = ImGui::CalcTextSize(bombLabel);
+                    const ImVec2 centered = { position.x + (lifeSize.x - bombSize.x) * 0.5f,
+                        position.y + (lifeSize.y - bombSize.y) * 0.5f };
+                    const float offset = std::max(1.0f, std::floor(bombSize.y * 0.14f));
+                    auto* draw = ImGui::GetWindowDrawList();
+                    draw->AddText({ centered.x - offset, centered.y - offset },
+                        ImGui::GetColorU32(ImVec4(color.x, color.y, color.z, 0.65f)), bombLabel);
+                    draw->AddText({ centered.x + offset, centered.y + offset }, ImGui::GetColorU32(color), bombLabel);
+                    ImGui::Dummy({ lifeSize.x, lifeSize.y + offset });
+                } else {
+                    ImGui::TextColored(cycle == 4 ? color_life_next : color_life, "%s", lifeLabel);
+                }
             }
         }
 
@@ -1674,13 +1774,54 @@ namespace TH14 {
         wchar_t _msg2[256];
     };
 
-    void ECLJump(ECLHelper& ecl, unsigned int start, unsigned int dest, int at_frame, int ecl_time = 0)
+    using PracticeEdits = std::vector<std::pair<uint8_t*, uint8_t>>;
+
+    class PracticeECL : public ECLHelper {
+    public:
+        explicit PracticeECL(void* base, PracticeEdits* edits = nullptr)
+            : files(static_cast<uintptr_t*>(base)), edits(edits)
+        {
+            SetBaseAddr(base);
+        }
+
+        void SetFile(unsigned ordinal)
+        {
+            file = ordinal;
+            ECLHelper::SetFile(ordinal);
+        }
+
+        template <typename T>
+        PracticeECL& operator<<(T value)
+        {
+            if (edits) {
+                auto bytes = reinterpret_cast<uint8_t*>(files[file] + GetPos());
+                for (size_t i = 0; i < sizeof(T); ++i)
+                    edits->emplace_back(bytes + i, bytes[i]);
+            }
+            ECLHelper::operator<<(value);
+            return *this;
+        }
+
+        template <typename Offset, typename T>
+        PracticeECL& operator<<(std::pair<Offset, T> edit)
+        {
+            SetPos(edit.first);
+            return *this << edit.second;
+        }
+
+    private:
+        uintptr_t* files;
+        PracticeEdits* edits;
+        unsigned file = 0;
+    };
+
+    void ECLJump(PracticeECL& ecl, unsigned int start, unsigned int dest, int at_frame, int ecl_time = 0)
     {
         ecl.SetPos(start);
         ecl << ecl_time << 0x0018000C << 0x02ff0000 << 0x00000000 << dest - start << at_frame;
     }
     constexpr unsigned int st7PostMaple = 0x7778;
-    __declspec(noinline) void THStageWarp(ECLHelper& ecl, int stage, int portion)
+    __declspec(noinline) void THStageWarp(PracticeECL& ecl, int stage, int portion)
     {
         if (stage == 1) {
             switch (portion) {
@@ -1871,7 +2012,7 @@ namespace TH14 {
             }
         }
     }
-    __declspec(noinline) void THPatch(ECLHelper& ecl, th_sections_t section)
+    __declspec(noinline) void THPatch(PracticeECL& ecl, th_sections_t section)
     {
         auto st6_boss = [&](int std_id) {
             ECLJump(ecl, 0x79d0, 0x2aa0, 0); // Jump to 630
@@ -2316,16 +2457,6 @@ namespace TH14 {
             ecl << pair{0x638, 1}; // Set Health
             ecl << pair{0x658, (int8_t)0x34}; // Set Spell Ordinal
             ecl << pair{0x75e0, (int16_t)0}; // Disable Item Drops
-            if (thPracParam.phase)
-            {
-                ecl << pair { 0x7CBC, (int16_t)0 };
-                ecl << pair { 0x7CE4, (int16_t)0 };
-                ecl << pair { 0x7CDC, (float)0.0174533f * thPracParam.st6bs8_phase };
-
-                ecl << pair { 0x7E00, (int16_t)0 };
-                ecl << pair { 0x7E28, (int16_t)0 };
-                ecl << pair { 0x7E20, (float)-0.0174533f * thPracParam.st6bs8_phase };
-            }
             break;
         case THPrac::TH14::TH14_ST6_BOSS9:
             st6_boss(4);
@@ -2634,7 +2765,7 @@ namespace TH14 {
             break;
         }
     }
-    __declspec(noinline) void THPatchSP(ECLHelper& ecl)
+    __declspec(noinline) void THPatchSP(PracticeECL& ecl)
     {
         uint32_t spell_id = *(int32_t*)(0x4f5844);
         switch (spell_id) {
@@ -2704,10 +2835,9 @@ namespace TH14 {
             break;
         }
     }
-    __declspec(noinline) void THSectionPatch()
+    __declspec(noinline) void THSectionPatch(PracticeEdits* edits)
     {
-        ECLHelper ecl;
-        ecl.SetBaseAddr((void*)GetMemAddr(0x4db544, 0xcc, 0xC));
+        PracticeECL ecl((void*)GetMemAddr(0x4db544, 0xcc, 0xC), edits);
 
         auto section = thPracParam.section;
         if (section >= 10000 && section < 20000) {
@@ -2717,6 +2847,1260 @@ namespace TH14 {
         } else {
             THPatch(ecl, (th_sections_t)section);
         }
+    }
+
+    namespace Pointdevice {
+        enum class Section {
+            Opening, Front2, Front3, Front4,
+            Mid1, Mid2, MidWave, Latter1, Latter2,
+            Boss1, Card1, Boss2, Card2, Boss3, Card3, Boss4, Card4, Card5, Card6,
+        };
+        using enum Section;
+        enum class Retry { Playing, Covering, Requested, Restoring, Ready, Go };
+        enum class BossRetryMusic { None, Start, Keep };
+
+        static constexpr ULONGLONG coverInMs = 176;
+        static constexpr ULONGLONG restartPulseMs = 200; // 5 Hz
+        static constexpr ULONGLONG readyPulseMs = 188;
+        static constexpr ULONGLONG readyDurationMs = 3 * readyPulseMs;
+        static constexpr ULONGLONG goDurationMs = 340;
+        static constexpr ULONGLONG chapterFinishFadeAtMs = 1280;
+        static constexpr ULONGLONG chapterFinishDurationMs = 1500;
+
+        struct Instruction {
+            unsigned file;
+            unsigned offset;
+            uint16_t opcode;
+        };
+
+        struct Jump {
+            Instruction from {};
+            unsigned destination = 0;
+            float time = 0;
+        };
+
+        struct Checkpoint {
+            unsigned file;
+            unsigned offset; // first instruction of the subroutine (opcode 40)
+            Section section;
+            Jump phaseJump {};
+            int health = 0;
+            int scene = 0;
+        };
+
+        struct Stage {
+            unsigned front;
+            unsigned midboss;
+            unsigned latter;
+            unsigned boss;
+            std::span<const Checkpoint> checkpoints;
+            std::span<const Instruction> midbossExits {};
+            unsigned titleWait; // LogoEnemy's ins_23, followed by ins_554 and ins_10
+            std::array<Instruction, 2> bossEntranceWaits;
+        };
+
+        // Japanese 1.00b ECL. File 0 is the stage, file 1 is default.ecl,
+        // and the boss files follow in the order listed by the stage's ECLI.
+        static constexpr Checkpoint stage1[] {
+            { 0, 0x441c, Opening }, // MainSub00
+            { 0, 0x47d8, Front2, { { 0, 0x40e4, 11 }, 0x4118 } },
+            { 0, 0x495c, Front3, { { 0, 0x40e4, 11 }, 0x414c } },
+            { 3, 0x00c8, Mid1 }, // MBoss
+            { 3, 0x12a4, Mid2, { { 3, 0x0478, 42 }, 0x0560 } }, // MBossCard1
+            { 0, 0x5104, Latter1 }, // MainSub04
+            { 0, 0x548c, Latter2, { { 0, 0x41e8, 11 }, 0x4218 } },
+            { 2, 0x065c, Boss1 },
+            { 2, 0x1a8c, Card1, { { 2, 0x0400, 42 }, 0x04e8 } },
+            { 2, 0x0fdc, Boss2, { { 2, 0x065c, 40 }, 0x0fdc } },
+            { 2, 0x2ca4, Card2, { { 2, 0x0400, 42 }, 0x05cc } },
+        };
+        static constexpr Checkpoint stage2[] {
+            { 0, 0x3400, Opening },
+            { 0, 0x3534, Front2, { { 0, 0x3004, 11 }, 0x3038 } },
+            { 0, 0x38b8, Front3, { { 0, 0x3004, 11 }, 0x306c } },
+            { 2, 0x012c, Mid1 },
+            { 2, 0x0de0, Mid2, { { 2, 0x03fc, 42 }, 0x04e4 } },
+            { 0, 0x3da4, MidWave, { { 0, 0x31c8, 524 }, 0x3220 } },
+            { 0, 0x4064, Latter1, { { 0, 0x3118, 23 }, 0x312c } },
+            { 0, 0x4374, Latter2, { { 0, 0x3118, 23 }, 0x3160 } },
+            { 3, 0x0824, Boss1 },
+            { 3, 0x2660, Card1, { { 3, 0x04e4, 42 }, 0x05cc } },
+            { 3, 0x13bc, Boss2, { { 3, 0x0824, 40 }, 0x13bc } },
+            { 3, 0x33f8, Card2, { { 3, 0x04e4, 42 }, 0x06b0 } },
+            { 3, 0x2368, Card3, { { 3, 0x0824, 40 }, 0x2368 } }, // Boss3 prepares the card
+        };
+        static constexpr Checkpoint stage3[] {
+            { 0, 0x2610, Opening },
+            { 0, 0x2a2c, Front2, { { 0, 0x21f4, 11 }, 0x2228 } },
+            { 0, 0x3270, Front3, { { 0, 0x21f4, 11 }, 0x2290 } },
+            { 2, 0x00e8, Mid1 },
+            { 2, 0x0c88, Mid2, { { 2, 0x05b4, 40 }, 0x0c88 } }, // MBoss2 selects the H/L card
+            { 0, 0x37c4, MidWave, { { 0, 0x23c4, 524 }, 0x241c } },
+            { 0, 0x3bb8, Latter1 },
+            { 0, 0x4064, Latter2, { { 0, 0x22f8, 11 }, 0x233c } },
+            { 3, 0x0798, Boss1 },
+            { 3, 0x20d8, Card1, { { 3, 0x0458, 42 }, 0x0540 } },
+            { 3, 0x0e38, Boss2, { { 3, 0x0798, 40 }, 0x0e38 } },
+            { 3, 0x38ac, Card2, { { 3, 0x0458, 42 }, 0x0624 } },
+            { 3, 0x174c, Boss3, { { 3, 0x0798, 40 }, 0x174c } },
+            { 3, 0x47cc, Card3, { { 3, 0x0458, 42 }, 0x0708 } },
+        };
+        static constexpr Checkpoint stage4[] {
+            { 0, 0x55d4, Opening },
+            { 0, 0x60f4, Front2, { { 0, 0x5090, 11 }, 0x50c4 } },
+            { 0, 0x6224, Front3, { { 0, 0x5090, 11 }, 0x50f8 } },
+            { 0, 0x6924, Front4, { { 0, 0x5090, 11 }, 0x512c } },
+            { 2, 0x00ec, Mid1 }, // MBoss
+            { 2, 0x1410, Mid2, { { 2, 0x04b4, 40 }, 0x1410 } },
+            { 3, 0x00d8, Mid1 }, // MBossB
+            { 3, 0x0c7c, Mid2, { { 3, 0x05bc, 40 }, 0x0c7c } },
+            { 0, 0x6a54, MidWave, { { 0, 0x5240, 524 }, 0x53c0 } },
+            { 0, 0x6d88, Latter1 },
+            { 0, 0x6f14, Latter2, { { 0, 0x5194, 11 }, 0x51d8 } },
+            { 4, 0x0828, Boss1 },
+            { 4, 0x6358, Card1, { { 4, 0x04e8, 42 }, 0x05d0 } },
+            { 4, 0x24a0, Boss2, { { 4, 0x0828, 40 }, 0x24a0 } },
+            { 4, 0x6c80, Card2, { { 4, 0x04e8, 42 }, 0x06b4 } },
+            { 4, 0x4498, Boss3, { { 4, 0x0828, 40 }, 0x4498 } },
+            { 4, 0x7d9c, Card3, { { 4, 0x04e8, 42 }, 0x0798 } },
+            { 5, 0x0798, Boss1 }, // BossB1
+            { 5, 0x1e80, Card1, { { 5, 0x0458, 42 }, 0x0540 } },
+            { 5, 0x0ec8, Boss2, { { 5, 0x0798, 40 }, 0x0ec8 } },
+            { 5, 0x2dc4, Card2, { { 5, 0x0458, 42 }, 0x0624 } },
+            { 5, 0x1634, Boss3, { { 5, 0x0798, 40 }, 0x1634 } },
+            { 5, 0x3580, Card3, { { 5, 0x0458, 42 }, 0x0708 } },
+        };
+        static constexpr Checkpoint stage5[] {
+            { 0, 0x2b5c, Opening },
+            { 0, 0x2dfc, Front2, { { 0, 0x2784, 11 }, 0x27b8 } },
+            { 0, 0x3e90, Front3, { { 0, 0x2784, 11 }, 0x27ec } },
+            { 0, 0x44c4, Front4, { { 0, 0x2784, 11 }, 0x2820 } },
+            { 2, 0x00a8, Mid1 },
+            { 2, 0x0d20, Mid2, { { 2, 0x03c4, 42 }, 0x04ac } },
+            { 0, 0x4a7c, Latter1 }, // MainSub04 and MainSub05 run together
+            { 0, 0x53e8, Latter2, { { 0, 0x2888, 11 }, 0x28dc } },
+            { 3, 0x0860, Boss1 },
+            { 3, 0x3334, Card1, { { 3, 0x043c, 42 }, 0x0524 } },
+            { 3, 0x1474, Boss2, { { 3, 0x0860, 40 }, 0x1474 } },
+            { 3, 0x4338, Card2, { { 3, 0x043c, 42 }, 0x0608 } },
+            { 3, 0x2358, Boss3, { { 3, 0x0860, 40 }, 0x2358 } },
+            { 3, 0x59d4, Card3, { { 3, 0x043c, 42 }, 0x06ec }, 5700 }, // story HP differs from spell practice
+            { 3, 0x5e30, Card4, { { 3, 0x043c, 42 }, 0x07d0 } },
+        };
+        static constexpr Checkpoint stage6[] {
+            { 0, 0x2fac, Opening },
+            { 0, 0x327c, Front2, { { 0, 0x2bc0, 11 }, 0x2bf4 } },
+            { 0, 0x37d0, Front3, { { 0, 0x2bc0, 11 }, 0x2c28 } },
+            { 0, 0x41c0, Front4, { { 0, 0x2bc0, 11 }, 0x2c5c } },
+            { 2, 0x00a0, Mid1 },
+            { 2, 0x0d5c, Mid2, { { 2, 0x0450, 40 }, 0x0d5c } },
+            { 3, 0x0b60, Boss1 },
+            { 3, 0x4aa8, Card1, { { 3, 0x0540, 42 }, 0x0628 } },
+            { 3, 0x1628, Boss2, { { 3, 0x0b60, 40 }, 0x1628 } },
+            { 3, 0x58a4, Card2, { { 3, 0x0540, 42 }, 0x070c }, 0, 3 },
+            { 3, 0x2788, Boss3, { { 3, 0x0b60, 40 }, 0x2788 } },
+            { 3, 0x6910, Card3, { { 3, 0x0540, 42 }, 0x07f0 }, 0, 4 },
+            { 3, 0x37b4, Boss4, { { 3, 0x0b60, 40 }, 0x37b4 } },
+            { 3, 0x75c8, Card4, { { 3, 0x0540, 42 }, 0x0908 }, 0, 4 },
+            { 3, 0x40dc, Card5, { { 3, 0x0b60, 40 }, 0x40dc } }, // Boss5/6 prepare the last two cards
+            { 3, 0x4580, Card6, { { 3, 0x0b60, 40 }, 0x4580 } },
+        };
+
+        // The instruction after boss mode is cleared in each midboss exit.
+        static constexpr Instruction exits1[] { { 3, 0x2408, 557 }, { 3, 0x2634, 502 } };
+        static constexpr Instruction exits2[] { { 2, 0x1cb0, 517 }, { 2, 0x1f34, 502 } };
+        static constexpr Instruction exits3[] { { 2, 0x26d0, 517 }, { 2, 0x2954, 502 } };
+        static constexpr Instruction exits4[] {
+            { 2, 0x2a30, 517 }, { 2, 0x2cb4, 502 }, { 3, 0x2380, 517 }, { 3, 0x2604, 502 },
+        };
+        static constexpr Instruction exits5[] { { 2, 0x1920, 517 }, { 2, 0x1ba4, 502 } };
+
+        static constexpr Stage stages[] {
+            { 0x6ae8, 0x6b08, 0x6b4c, 0x6bbc, stage1, exits1, 0x3e68, { { { 2, 0x0284, 23 } } } },
+            { 0x51c4, 0x51e4, 0x5218, 0x5274, stage2, exits2, 0x2d9c, { { { 3, 0x0368, 23 } } } },
+            { 0x6720, 0x6740, 0x6774, 0x67d0, stage3, exits3, 0x1f9c, { { { 3, 0x02f8, 23 } } } },
+            { 0x9ab4, 0x9ae4, 0x9b18, 0x9b74, stage4, exits4, 0x4b90, { { { 4, 0x0340, 23 }, { 5, 0x02b0, 23 } } } },
+            { 0x8910, 0x8940, 0x8988, 0x89e4, stage5, exits5, 0x252c, { { { 3, 0x02dc, 23 } } } },
+            { 0x7bb8, 0x7bd8, 0,      0x7c68, stage6, {}, 0x2958, { { { 3, 0x03cc, 23 } } } },
+        };
+
+        // Story resources, including an unfinished item collection bonus.
+        static constexpr uintptr_t resourceAddresses[] {
+            0x4f5830, 0x4f583c, 0x4f5840, 0x4f5848, // score, rank, graze, items
+            0x4f584c, 0x4f5858, // point item value, power
+            0x4f5864, 0x4f5868, 0x4f586c, 0x4f5870, 0x4f5874, // lives, extends, bombs and fragments
+            0x4f5878, 0x4f5880, 0x4f5884, 0x4f5888, 0x4f588c, 0x4f5890, 0x4f5894, // item bonus
+        };
+
+        static constexpr size_t itemCount = 0x1258, itemStride = 0xc18;
+        static constexpr uintptr_t itemArrayOffset = 0x14;
+
+        struct ItemSnapshot {
+            std::array<float, 3> position; // +bac
+            std::array<float, 3> velocity; // +bb8
+            std::array<uint32_t, 3> timer; // +bc8, before the timer's clock pointer
+            int motion; // +bf0
+            int type; // +bf4
+            float homingSpeed; // +bfc
+            int delay; // +c00
+        };
+
+        static struct {
+            unsigned stage = 0;
+            Retry retry = Retry::Playing;
+            bool stageLoadComplete = false;
+            ULONGLONG retryShownAt = 0;
+            ULONGLONG restartShownAt = 0;
+            bool retryFrameDrawn = false;
+            bool coverFrameDrawn = false;
+            bool coverPresented = false;
+            bool pausedRetryMusic = false;
+            const Checkpoint* checkpoint = nullptr;
+            const Checkpoint* practiceEntry = nullptr;
+            const Checkpoint* waitingForMidboss = nullptr;
+            PracticeEdits practiceEdits;
+            ULONGLONG chapterFinishStartedAt = 0;
+            bool clearedPreviousStage = false;
+            std::array<uintptr_t, 6> files {};
+            std::array<Jump, 4> jumps {};
+            std::array<uint32_t, elementsof(resourceAddresses)> resources {};
+            ChapterCounts chapterCounts {};
+            std::vector<ItemSnapshot> items;
+            bool hasItemSnapshot = false;
+            std::array<float, 3> playerPosition {};
+            std::array<int32_t, 2> playerFixedPosition {};
+            // Previous, resolved, absolute and relative movement, plus the eight
+            // interpolators consumed by the enemy movement update at 0x4230d0.
+            std::array<uint8_t, 4 * 0x44> bossMovement {};
+            std::array<uint8_t, 2 * 0x68 + 4 * 0x30 + 2 * 0x44> bossInterpolators {};
+            std::array<uint8_t, 0xc> bossInvulnerability {}; // Timer values, excluding the clock pointer.
+            bool hasPlayerPosition = false;
+            bool hasBossPosition = false;
+            uint32_t bossItemFlag = 0;
+            uint8_t bossTimeout = 0;
+            double stageMusicPosition = 0;
+            bool deferredStageMusic = false;
+            bool seekStageMusic = false;
+            BossRetryMusic bossRetryMusic = BossRetryMusic::None;
+            bool holdMidbossMusic = false;
+            // STD playback state; exclude ANM objects, callbacks and allocations.
+            std::array<uint8_t, 0x2c> backgroundTimers {}; // +20..4c
+            std::array<uint8_t, 0x1b0> backgroundInterpolators {}; // +50..200
+            std::array<uint8_t, 0x12c> backgroundCamera {}; // +4274..43a0
+            uintptr_t backgroundInstruction = 0; // relative to the STD script
+            uint32_t backgroundDrawDistance = 0;
+            bool hasBackground = false;
+            uintptr_t titleVm = 0;
+            float titleTime = 0;
+            bool titlePending = false;
+            bool restoreTitle = false;
+        } run;
+
+        static constexpr uint16_t markerOpcode = 93;
+
+        static void RestoreStageTitle(const Stage& stage)
+        {
+            if (!run.titleVm)
+                return;
+            run.restoreTitle = false;
+            auto& time = *reinterpret_cast<float*>(run.titleVm);
+            if (run.titlePending) {
+                time = run.titleTime;
+            } else {
+                // Finish the rebuilt LogoEnemy without starting a second title.
+                *reinterpret_cast<uintptr_t*>(run.titleVm + 4) = run.files[0] + stage.titleWait + 0x24;
+                time = 0;
+                run.titleVm = 0;
+            }
+        }
+
+        static bool IsStoryStage(unsigned stage)
+        {
+            return pointdeviceRun && thPracParam.mode <= 1 && stage >= 1 && stage <= elementsof(stages);
+        }
+
+        static void Reset()
+        {
+            run = {};
+        }
+
+        static void SetRetryPhase(Retry phase)
+        {
+            run.retry = phase;
+            if (phase == Retry::Playing)
+                run.holdMidbossMusic = false;
+            run.retryShownAt = 0;
+            run.retryFrameDrawn = false;
+            run.coverFrameDrawn = false;
+            run.coverPresented = false;
+        }
+
+        static ULONGLONG RetryElapsed(ULONGLONG now)
+        {
+            return run.retryShownAt ? now - run.retryShownAt : 0;
+        }
+
+        static void RetryPresented(ULONGLONG now, bool succeeded)
+        {
+            if (succeeded && run.retryFrameDrawn) {
+                if (!run.retryShownAt)
+                    run.retryShownAt = now;
+                if (run.retry == Retry::Covering && !run.restartShownAt)
+                    run.restartShownAt = now;
+                run.coverPresented |= run.coverFrameDrawn;
+            }
+            run.retryFrameDrawn = false;
+            run.coverFrameDrawn = false;
+        }
+
+        static bool RetryRebuilding()
+        {
+            return run.retry == Retry::Requested || run.retry == Retry::Restoring;
+        }
+
+        static bool RetryFreezesGameplay()
+        {
+            return run.retry == Retry::Covering || run.retry == Retry::Ready || run.retry == Retry::Go;
+        }
+
+        static constexpr unsigned retryVirtualKeys[] { VK_SHIFT, VK_LSHIFT, VK_RSHIFT, 'Z', 'X', VK_ESCAPE };
+        static constexpr unsigned retryScanCodes[] { DIK_LSHIFT, DIK_RSHIFT, DIK_Z, DIK_X, DIK_ESCAPE };
+
+        static bool IgnoreRetryKey(WPARAM key)
+        {
+            return run.retry != Retry::Playing && std::ranges::find(retryVirtualKeys, key) != std::end(retryVirtualKeys);
+        }
+
+        static void FilterRetryKeyboard(PCONTEXT ctx, std::span<const unsigned> blockedKeys)
+        {
+            if (run.retry == Retry::Playing)
+                return;
+            auto* keyboard = reinterpret_cast<uint8_t*>(ctx->Ebp - 0x104);
+            for (const auto key : blockedKeys)
+                keyboard[key] = 0;
+        }
+
+        static float EaseRetry(float progress)
+        {
+            const float t = std::clamp(progress, 0.0f, 1.0f);
+            return t * t * (3.0f - 2.0f * t);
+        }
+
+        static float RetryPulseOpacity(ULONGLONG elapsed, ULONGLONG period)
+        {
+            const float pulse = static_cast<float>(elapsed % period) / period;
+            return EaseRetry(pulse / 0.20f) * (1.0f - EaseRetry((pulse - 0.55f) / 0.32f));
+        }
+
+        static float ChapterFinishOpacity(ULONGLONG elapsed)
+        {
+            constexpr auto lastPulseAt = 2 * readyPulseMs;
+            if (elapsed < lastPulseAt)
+                return RetryPulseOpacity(elapsed, readyPulseMs);
+            if (elapsed < chapterFinishFadeAtMs)
+                return EaseRetry(static_cast<float>(elapsed - lastPulseAt) / (0.20f * readyPulseMs));
+            return 1.0f - EaseRetry(static_cast<float>(elapsed - chapterFinishFadeAtMs)
+                / (chapterFinishDurationMs - chapterFinishFadeAtMs));
+        }
+
+        static float RestartOpacity(ULONGLONG now)
+        {
+            const auto elapsed = run.restartShownAt ? now - run.restartShownAt : 0;
+            // Align the first bright pulse with the end of the cover's sweep.
+            return RetryPulseOpacity(elapsed + restartPulseMs / 2, restartPulseMs);
+        }
+
+        static void FinishRetryMusic(bool pause)
+        {
+            const auto musicMode = GetMemContent<uint8_t>(0x4d9151);
+            if (run.bossRetryMusic == BossRetryMusic::Keep || !musicMode)
+                return;
+
+            // Finish any play/seek command under Restart, including a boss
+            // track that had to be loaded because it was no longer playing.
+            const auto updateMusic = reinterpret_cast<int(__cdecl*)()>(0x46e5e0);
+            while (updateMusic()) {
+            }
+            if (!pause || musicMode != 1)
+                return;
+
+            const auto player = GetMemContent(0x4fd180);
+            if (player && GetMemContent<int>(player + 0x50) && !GetMemContent<int>(player + 0x9c)) {
+                reinterpret_cast<void(__thiscall*)(uintptr_t)>(0x481300)(player);
+                run.pausedRetryMusic = true;
+            }
+        }
+
+        static void StartDeferredStageMusic()
+        {
+            if (!run.deferredStageMusic)
+                return;
+            run.deferredStageMusic = false;
+            run.seekStageMusic = run.stageMusicPosition >= 0.001;
+            const auto stageInfo = GetMemContent(0x4db69c);
+            reinterpret_cast<void(__stdcall*)(int, int)>(0x445710)(0, GetMemContent<int>(stageInfo + 0x30));
+        }
+
+        static bool AdvanceRetry(ULONGLONG now)
+        {
+            const auto elapsed = RetryElapsed(now);
+            switch (run.retry) {
+            case Retry::Covering:
+                if (run.coverPresented) {
+                    SetRetryPhase(Retry::Requested);
+                    *reinterpret_cast<int32_t*>(SUPERVISOR_NEXT_STATE) = 10; // native restart
+                }
+                break;
+            case Retry::Ready:
+                if (elapsed >= readyDurationMs)
+                    SetRetryPhase(Retry::Go);
+                break;
+            case Retry::Go:
+                if (elapsed >= goDurationMs) {
+                    if (run.holdMidbossMusic) {
+                        run.holdMidbossMusic = false;
+                        StartDeferredStageMusic();
+                        FinishRetryMusic(false);
+                    } else if (run.pausedRetryMusic) {
+                        const auto player = GetMemContent(0x4fd180);
+                        if (player)
+                            reinterpret_cast<void(__thiscall*)(uintptr_t)>(0x481390)(player);
+                        run.pausedRetryMusic = false;
+                    }
+                    SetRetryPhase(Retry::Playing);
+                }
+                break;
+            default:
+                break;
+            }
+            return RetryFreezesGameplay();
+        }
+
+        static uintptr_t MusicPlayer(unsigned slot)
+        {
+            // thbgm.dat playback. The other backend uses separate WAV streams.
+            if (GetMemContent<uint8_t>(0x4d916c) & 0x10)
+                return 0;
+            const auto player = GetMemContent(0x4fd180);
+            if (!player)
+                return 0;
+            const auto name = reinterpret_cast<const char*>(0x4f9e00);
+            const auto loaded = reinterpret_cast<const char*>(0x4fc080 + slot * 0x100);
+            return *name && std::strcmp(name, loaded) == 0 ? player : 0;
+        }
+
+        static bool IsMusicPlaying(unsigned slot)
+        {
+            const auto player = MusicPlayer(slot);
+            return player && GetMemContent<int>(player + 0x50);
+        }
+
+        static bool IsMidbossCheckpoint(Section section)
+        {
+            return section == Mid1 || section == Mid2;
+        }
+
+        static bool HoldMidbossMusicCommand(int command)
+        {
+            // Native BGM queue commands for Play, Resume and seeking a new track.
+            return run.holdMidbossMusic && (command == 2 || command == 7 || command == 8);
+        }
+
+        static bool IsRetryTrackPlaying(int slot)
+        {
+            if (!(GetMemContent<uint8_t>(0x4d916c) & 0x10))
+                return IsMusicPlaying(slot);
+
+            // The separate WAV backend keeps its track name and thread here.
+            const auto name = reinterpret_cast<const char*>(0x4f94dc);
+            const auto loaded = reinterpret_cast<const char*>(0x4fc080 + slot * 0x100);
+            return GetMemContent(0x4f7b6c) && *name && std::strcmp(name, loaded) == 0;
+        }
+
+        static void StageMusicAtCheckpoint(bool restoring)
+        {
+            if (restoring) {
+                if (!run.holdMidbossMusic)
+                    StartDeferredStageMusic();
+            } else {
+                // The pause menu uses this same loop-aware position in seconds.
+                run.stageMusicPosition = IsMusicPlaying(0) ? reinterpret_cast<double(__vectorcall*)()>(0x44beb0)() : 0;
+            }
+        }
+
+        static void SeekStageMusic(PCONTEXT ctx)
+        {
+            // The command's slot has already been replaced by native playback state.
+            // Match the prepared track when the game is about to start its buffer.
+            if (!run.seekStageMusic)
+                return;
+            const auto player = MusicPlayer(0);
+            if (!player)
+                return;
+            run.seekStageMusic = false;
+            const auto buffers = GetMemContent(player + 4);
+            if (!buffers || !GetMemContent(buffers))
+                return;
+
+            // Native seek refills and starts the buffer with the stored Play flags.
+            const auto args = reinterpret_cast<const int*>(ctx->Esp);
+            *reinterpret_cast<int*>(player + 0x20) = args[0];
+            *reinterpret_cast<int*>(player + 0x24) = args[1];
+            // TH14 expects the position in XMM1. The first double occupies XMM0.
+            reinterpret_cast<void(__vectorcall*)(uintptr_t, double, double)>(0x481ee0)(player, 0.0, run.stageMusicPosition);
+            ctx->Esp += 3 * sizeof(int);
+            ctx->Eip = 0x46e91a;
+        }
+
+        static void CheckpointBackground(bool restoring)
+        {
+            const auto background = GetMemContent(0x4db528);
+            const auto script = background ? GetMemContent(background + 0x1c) : 0;
+            const auto instruction = background ? GetMemContent(background + 0x4c) : 0;
+            if (!restoring)
+                run.hasBackground = script && instruction >= script;
+            if (!script || !run.hasBackground)
+                return;
+
+            const auto copy = [restoring](auto& state, uintptr_t address) {
+                if (restoring)
+                    std::memcpy(reinterpret_cast<void*>(address), state.data(), sizeof(state));
+                else
+                    std::memcpy(state.data(), reinterpret_cast<const void*>(address), sizeof(state));
+            };
+            copy(run.backgroundTimers, background + 0x20);
+            copy(run.backgroundInterpolators, background + 0x50);
+            copy(run.backgroundCamera, background + 0x4274);
+            auto& cursor = *reinterpret_cast<uintptr_t*>(background + 0x4c);
+            auto& drawDistance = *reinterpret_cast<uint32_t*>(background + 0x308c);
+            if (restoring) {
+                // Native restart reallocates the STD file. Never reuse its old IP.
+                cursor = script + run.backgroundInstruction;
+                drawDistance = run.backgroundDrawDistance;
+            } else {
+                run.backgroundInstruction = cursor - script;
+                run.backgroundDrawDistance = drawDistance;
+            }
+        }
+
+        static void CheckpointPositions(const Checkpoint& checkpoint, uintptr_t vm, bool restoring)
+        {
+            const auto player = GetMemContent(PLAYER_PTR);
+            const auto section = checkpoint.section;
+            const auto boss = (IsMidbossCheckpoint(section) || section >= Boss1)
+                ? GetMemContent(vm + 0x1014) : 0;
+            const auto copyState = [restoring](auto& state, uintptr_t address) {
+                auto memory = reinterpret_cast<void*>(address);
+                if (restoring)
+                    std::memcpy(memory, state.data(), sizeof(state));
+                else
+                    std::memcpy(state.data(), memory, sizeof(state));
+            };
+
+            if (!restoring) {
+                run.hasPlayerPosition = player != 0;
+                run.hasBossPosition = boss != 0;
+            }
+            if (player && run.hasPlayerPosition) {
+                copyState(run.playerPosition, player + 0x5e0);
+                copyState(run.playerFixedPosition, player + 0x5ec);
+                if (restoring)
+                    std::memcpy(reinterpret_cast<void*>(player + 0x5b0), run.playerPosition.data(), sizeof(run.playerPosition));
+            }
+            if (boss && run.hasBossPosition) {
+                copyState(run.bossMovement, boss + 0x11f0);
+                copyState(run.bossInterpolators, boss + 0x14e8);
+                if (section >= Boss1)
+                    copyState(run.bossInvulnerability, boss + 0x3fec);
+            }
+        }
+
+        static void CheckpointItems(bool restoring)
+        {
+            const auto manager = GetMemContent(ITEM_MANAGER_PTR);
+            if (!restoring) {
+                run.items.clear();
+                run.hasItemSnapshot = manager != 0;
+            }
+            if (!manager || !run.hasItemSnapshot)
+                return;
+
+            // The restore route may have spawned its own copies of carryover items.
+            const auto releaseItem = reinterpret_cast<void(__thiscall*)(uintptr_t)>(0x439c10);
+            const auto endEffect = reinterpret_cast<void(__stdcall*)(int, int)>(0x47f140);
+            auto item = manager + itemArrayOffset;
+            for (size_t i = 0; i < itemCount; ++i, item += itemStride) {
+                const int motion = GetMemContent<int>(item + 0xbf0);
+                const int type = GetMemContent<int>(item + 0xbf4);
+                if (!motion || !((type >= 1 && type <= 3) || type == bombFragmentItem))
+                    continue;
+                if (restoring) {
+                    if (const int effect = GetMemContent<int>(item + 0xba8))
+                        endEffect(effect, 1);
+                    releaseItem(item);
+                } else {
+                    run.items.push_back({
+                        GetMemContent<std::array<float, 3>>(item + 0xbac),
+                        GetMemContent<std::array<float, 3>>(item + 0xbb8),
+                        GetMemContent<std::array<uint32_t, 3>>(item + 0xbc8),
+                        motion, type, GetMemContent<float>(item + 0xbfc), GetMemContent<int>(item + 0xc00)
+                    });
+                }
+            }
+            if (!restoring)
+                return;
+
+            // A fresh native pool allocates slots in descending order.
+            for (auto saved = run.items.rbegin(); saved != run.items.rend(); ++saved) {
+                // A nonzero spawn delay suppresses the reward sound and popup.
+                // Restore the real delay immediately after the game allocates its VMs.
+                const auto spawned = spawnItem(manager, saved->type, saved->position.data(), 0, 0.0f, 0.0f, 1);
+                if (!spawned)
+                    break;
+                std::memcpy(reinterpret_cast<void*>(spawned + 0xbac), saved->position.data(), sizeof(saved->position));
+                std::memcpy(reinterpret_cast<void*>(spawned + 0xbb8), saved->velocity.data(), sizeof(saved->velocity));
+                std::memcpy(reinterpret_cast<void*>(spawned + 0xbc8), saved->timer.data(), sizeof(saved->timer));
+                *reinterpret_cast<int*>(spawned + 0xbf0) = saved->motion;
+                *reinterpret_cast<float*>(spawned + 0xbfc) = saved->homingSpeed;
+                *reinterpret_cast<int*>(spawned + 0xc00) = saved->delay;
+            }
+        }
+
+        static void Reach(const Checkpoint& checkpoint, uintptr_t vm)
+        {
+            const bool restoring = run.retry == Retry::Restoring;
+            if (restoring ? &checkpoint != run.checkpoint
+                          : run.checkpoint && checkpoint.section <= run.checkpoint->section)
+                return;
+
+            CheckpointPositions(checkpoint, vm, restoring);
+            if (checkpoint.section == Mid2 || checkpoint.section >= Card1) {
+                // BossItemCard/Phase reads these flags from the preceding phase.
+                auto& itemFlag = *reinterpret_cast<uint32_t*>(GetMemAddr(ENEMY_MANAGER_PTR, 0x18));
+                const auto enemy = GetMemContent(vm + 0x1014);
+                auto& enemyFlags = *reinterpret_cast<uint8_t*>(enemy + 0x5247);
+                if (restoring) {
+                    itemFlag = run.bossItemFlag;
+                    enemyFlags = (enemyFlags & 0xfe) | run.bossTimeout;
+                    if (&checkpoint != run.practiceEntry && checkpoint.health) {
+                        // Match opcode 511's HP fields when the story threshold differs.
+                        auto hp = reinterpret_cast<int32_t*>(enemy + 0x5164);
+                        hp[0] = hp[1] = hp[2] = checkpoint.health;
+                        hp[3] = checkpoint.health * 7;
+                    }
+                    if (&checkpoint != run.practiceEntry && checkpoint.scene)
+                        reinterpret_cast<void(__stdcall*)(int)>(0x410470)(checkpoint.scene); // STD event
+                } else {
+                    run.bossItemFlag = itemFlag;
+                    run.bossTimeout = enemyFlags & 1;
+                }
+            }
+
+            // Restore after the retry route's STD events, which otherwise reset
+            // the camera script to the beginning of a boss scene.
+            CheckpointBackground(restoring);
+            if (restoring) {
+                RestoreStageTitle(stages[run.stage - 1]);
+            } else {
+                run.titlePending = run.titleVm != 0;
+                if (run.titlePending)
+                    run.titleTime = GetMemContent<float>(run.titleVm);
+            }
+            for (size_t i = 0; i < run.resources.size(); ++i) {
+                auto& resource = *reinterpret_cast<uint32_t*>(resourceAddresses[i]);
+                if (restoring)
+                    resource = run.resources[i];
+                else
+                    run.resources[i] = resource;
+            }
+            if (restoring)
+                chapterCounts = run.chapterCounts;
+            else
+                run.chapterCounts = chapterCounts;
+            CheckpointItems(restoring);
+            if (restoring) {
+                // Stage initialization drew the counters before the checkpoint
+                // restored their values. Refresh both rows, including fragments.
+                if (const auto hud = GetMemContent(0x4db550)) {
+                    using UpdateCounter = void(__thiscall*)(uintptr_t, int, int);
+                    reinterpret_cast<UpdateCounter>(0x434ef0)(hud, GetMemContent<int>(0x4f5864), GetMemContent<int>(0x4f5868));
+                    reinterpret_cast<UpdateCounter>(0x434fd0)(hud, GetMemContent<int>(0x4f5870), GetMemContent<int>(0x4f5874));
+                }
+            }
+            if (checkpoint.section < Boss1)
+                StageMusicAtCheckpoint(restoring);
+            if (!restoring) {
+                if (run.checkpoint || run.clearedPreviousStage)
+                    run.chapterFinishStartedAt = GetTickCount64();
+                if (!run.checkpoint && thPracParam.mode == 1)
+                    run.practiceEntry = &checkpoint;
+                run.clearedPreviousStage = false;
+            }
+            run.checkpoint = &checkpoint;
+            if (restoring) {
+                FinishRetryMusic(checkpoint.section < Boss1 && !run.holdMidbossMusic);
+                SetRetryPhase(Retry::Ready);
+            }
+        }
+
+        static void PlanRetry(const Stage& stage)
+        {
+            const auto& checkpoint = *run.checkpoint;
+            const auto section = checkpoint.section;
+            if (section >= Boss1)
+                run.jumps[0] = { { 0, stage.front, 11 }, stage.boss, 60 };
+            else if (section >= Latter1)
+                run.jumps[0] = { { 0, stage.front, 11 }, stage.latter, 60 };
+            else if (section >= Mid1)
+                run.jumps[0] = { { 0, stage.front, 11 }, stage.midboss, 60 };
+            run.jumps[1] = checkpoint.phaseJump;
+
+            if (run.stage == 4 && section >= Boss1) {
+                // These actors are part of the skipped pre-boss dialogue.
+                run.jumps[2] = checkpoint.file == 4 ? Jump { { 4, 0x9950, 515 }, 0x9ab4 }
+                                                    : Jump { { 5, 0x4dcc, 515 }, 0x4f30 };
+            }
+        }
+
+        static uintptr_t Address(Instruction instruction)
+        {
+            return run.files[instruction.file] + instruction.offset;
+        }
+
+        static uint16_t& OpcodeAt(Instruction instruction)
+        {
+            return *reinterpret_cast<uint16_t*>(Address(instruction) + 4);
+        }
+
+        static Instruction Entry(const Checkpoint& checkpoint)
+        {
+            return { checkpoint.file, checkpoint.offset, 40 };
+        }
+
+        template <typename Action>
+        static void ForEachMarker(const Stage& stage, Action action)
+        {
+            action(Instruction { 0, stage.titleWait, 23 });
+            action(Instruction { 0, stage.titleWait + 0x14, 554 });
+            for (const auto& checkpoint : stage.checkpoints)
+                action(Entry(checkpoint));
+            for (const auto& instruction : stage.midbossExits)
+                action(instruction);
+            for (const auto& jump : run.jumps) {
+                if (jump.destination)
+                    action(jump.from);
+            }
+        }
+
+        static void InitStage(PracticeEdits edits = {})
+        {
+            const auto stageNumber = GetMemContent<unsigned>(STAGE_NUM);
+            if (!IsStoryStage(stageNumber)) {
+                Reset();
+                return;
+            }
+
+            const bool retrying = run.retry == Retry::Requested && run.stage == stageNumber;
+            if (!retrying) {
+                const bool clearedPreviousStage = run.checkpoint && stageNumber == run.stage + 1;
+                Reset();
+                run.clearedPreviousStage = clearedPreviousStage;
+            }
+            run.practiceEdits = std::move(edits);
+            run.stage = stageNumber;
+            const auto& stage = stages[stageNumber - 1];
+
+            const auto manager = GetMemContent(ENEMY_MANAGER_PTR);
+            const auto loader = manager ? GetMemContent(manager + 0xcc) : 0;
+            if (!loader) {
+                run.bossRetryMusic = BossRetryMusic::None;
+                SetRetryPhase(Retry::Playing);
+                return;
+            }
+            const auto fileCount = stageNumber == 4 ? 6u : 4u;
+            for (unsigned i = 0; i < fileCount; ++i)
+                run.files[i] = GetMemContent(loader + 0xc + i * sizeof(uintptr_t));
+
+            if (retrying) {
+                const bool practiceEntry = run.checkpoint == run.practiceEntry;
+                if (!practiceEntry)
+                    PlanRetry(stage);
+                if (run.checkpoint->section >= Boss1 && (!practiceEntry || !thPracParam.dlg)) {
+                    const auto wait = stage.bossEntranceWaits[stage.bossEntranceWaits[0].file != run.checkpoint->file];
+                    run.jumps[3] = { wait, wait.offset + 0x14 }; // Skip only the entrance's ins_23.
+                }
+            }
+
+            bool valid = true;
+            ForEachMarker(stage, [&](Instruction instruction) {
+                valid = valid && run.files[instruction.file]
+                    && (!run.practiceEdits.empty() || OpcodeAt(instruction) == instruction.opcode);
+            });
+            if (!valid) {
+                run.files = {};
+                run.jumps = {};
+                run.bossRetryMusic = BossRetryMusic::None;
+                SetRetryPhase(Retry::Playing);
+                return;
+            }
+
+            // Opcode 93 has a dedicated VM case. Only tagged instruction addresses
+            // dispatch into this code, and each tag is restored before execution.
+            ForEachMarker(stage, [](Instruction instruction) {
+                auto& opcode = OpcodeAt(instruction);
+                if (opcode == instruction.opcode)
+                    opcode = markerOpcode;
+            });
+            if (retrying) {
+                run.stageLoadComplete = false;
+                SetRetryPhase(Retry::Restoring);
+                run.restoreTitle = true;
+            }
+        }
+
+        static void UnpatchStage()
+        {
+            // The native restart can keep the loaded ECL. Undo unvisited markers
+            // before the enemy manager is reset or destroyed.
+            if (run.files[0]) {
+                ForEachMarker(stages[run.stage - 1], [](Instruction instruction) {
+                    auto& opcode = OpcodeAt(instruction);
+                    if (opcode == markerOpcode)
+                        opcode = instruction.opcode;
+                });
+            }
+            for (auto edit = run.practiceEdits.rbegin(); edit != run.practiceEdits.rend(); ++edit)
+                *edit->first = edit->second;
+            run.practiceEdits.clear();
+            run.chapterFinishStartedAt = 0;
+            run.files = {};
+            run.jumps = {};
+            run.waitingForMidboss = nullptr;
+            run.titleVm = 0;
+            if (run.retry != Retry::Requested) {
+                run.bossRetryMusic = BossRetryMusic::None;
+                SetRetryPhase(Retry::Playing);
+            }
+        }
+
+        static void EclMarker(PCONTEXT ctx)
+        {
+            if (!run.files[0])
+                return;
+
+            const auto& stage = stages[run.stage - 1];
+            auto& ip = *reinterpret_cast<uintptr_t*>(ctx->Edi + 4);
+            const auto execute = [&](Instruction instruction) {
+                OpcodeAt(instruction) = instruction.opcode;
+                ctx->Eip = 0x4823c0; // ECL dispatch
+            };
+
+            if (ip == run.files[0] + stage.titleWait) {
+                execute({ 0, stage.titleWait, 23 });
+                run.titleVm = ctx->Edi;
+                if (run.restoreTitle) {
+                    ip += 0x14;
+                    ctx->Eip = 0x483c2b; // Continue with the VM's time check.
+                    if (run.retry == Retry::Restoring) {
+                        // Keep the title waiting while the checkpoint is rebuilt.
+                        *reinterpret_cast<float*>(ctx->Edi) = -1000000.0f;
+                    } else {
+                        RestoreStageTitle(stage);
+                    }
+                }
+                return;
+            }
+            if (ip == run.files[0] + stage.titleWait + 0x14) {
+                execute({ 0, stage.titleWait + 0x14, 554 });
+                run.titleVm = 0;
+                return;
+            }
+
+            // A retry jump can be installed at a checkpoint for an earlier phase.
+            for (const auto& jump : run.jumps) {
+                if (jump.destination && ip == Address(jump.from)) {
+                    execute(jump.from);
+                    ip = run.files[jump.from.file] + jump.destination;
+                    *reinterpret_cast<float*>(ctx->Edi) = jump.time;
+                    return;
+                }
+            }
+            for (const auto& checkpoint : stage.checkpoints) {
+                const auto instruction = Entry(checkpoint);
+                if (ip != Address(instruction))
+                    continue;
+
+                execute(instruction);
+                if (run.retry == Retry::Requested)
+                    return;
+                if (checkpoint.section >= MidWave && checkpoint.section <= Latter2
+                    && GetMemContent(ENEMY_MANAGER_PTR, 0x5c)) {
+                    // The stage can start scheduling waves before the midboss leaves.
+                    run.waitingForMidboss = &checkpoint;
+                } else {
+                    Reach(checkpoint, ctx->Edi);
+                    if (run.retry == Retry::Ready)
+                        ctx->Eip = 0x483cf6; // Yield the VM, leaving the entry instruction pending.
+                }
+                return;
+            }
+            for (const auto& instruction : stage.midbossExits) {
+                if (ip == Address(instruction)) {
+                    execute(instruction);
+                    if (run.waitingForMidboss && run.retry != Retry::Requested)
+                        Reach(*run.waitingForMidboss, ctx->Edi);
+                    run.waitingForMidboss = nullptr;
+                    if (run.retry == Retry::Ready)
+                        ctx->Eip = 0x483cf6;
+                    return;
+                }
+            }
+        }
+
+        static void TrackStageLoad(uint32_t flags)
+        {
+            // The stage can defer setup until frame 30. Let it finish resetting
+            // the player, items, enemies and music before restoring a checkpoint.
+            if (run.retry == Retry::Restoring)
+                run.stageLoadComplete = !(flags & 0x800);
+        }
+
+        static void FastForwardStageStart(uintptr_t vm)
+        {
+            if (run.retry != Retry::Restoring || !run.stageLoadComplete || run.checkpoint->section >= Boss1)
+                return;
+
+            const auto& stage = stages[run.stage - 1];
+            const auto firstWave = run.files[0] + stage.front;
+            if (GetMemContent(vm + 4) == firstWave) {
+                // MainFront and the retry destinations share the same ECL time.
+                auto& time = *reinterpret_cast<float*>(vm);
+                time = std::max(time, 60.0f);
+            }
+        }
+
+        static bool RequestRetry(PCONTEXT ctx)
+        {
+            const auto stageNumber = GetMemContent<unsigned>(STAGE_NUM);
+            if (run.retry != Retry::Playing || !run.checkpoint || !run.files[0]
+                || run.stage != stageNumber || !IsStoryStage(stageNumber))
+                return false;
+
+            const auto section = run.checkpoint->section;
+            run.bossRetryMusic = BossRetryMusic::None;
+            if (section >= Boss1)
+                run.bossRetryMusic = IsRetryTrackPlaying(1) ? BossRetryMusic::Keep : BossRetryMusic::Start;
+            const auto enemies = GetMemContent(ENEMY_MANAGER_PTR);
+            run.holdMidbossMusic = section < Boss1 && (IsMidbossCheckpoint(section)
+                || (enemies && GetMemContent(enemies + 0x5c)));
+            run.deferredStageMusic = run.holdMidbossMusic;
+            run.seekStageMusic = false;
+            run.restartShownAt = 0;
+            SetRetryPhase(Retry::Covering);
+            if (run.holdMidbossMusic) {
+                // Native pause can skip a busy streaming buffer. Stop all BGM
+                // buffers now. The checkpoint track is restarted after GO.
+                const auto player = GetMemContent(0x4fd180);
+                if (player)
+                    reinterpret_cast<void(__thiscall*)(uintptr_t, int)>(0x481280)(player, 0);
+            }
+            // Hold the current frame until Restart has been drawn, then queue
+            // the native restart. Suppress the life loss while the request waits.
+            ctx->Eax = GetMemContent<DWORD>(0x4f5864);
+            ctx->EFlags &= ~0x80u; // the following JS checks the original DEC's sign
+            return true;
+        }
+
+        static void SelectRestartStage(PCONTEXT ctx)
+        {
+            if (run.retry != Retry::Requested)
+                return;
+
+            // The original instruction reads the run's starting stage. Supply
+            // the checkpoint stage while leaving the original start stage intact.
+            ctx->Eax = run.stage;
+            ctx->Eip = 0x447815;
+        }
+
+        static bool RouteStageMusic(int& slot)
+        {
+            // Native delayed stage loading can run after the boss checkpoint is restored.
+            if (run.bossRetryMusic != BossRetryMusic::None) {
+                slot = 1;
+                return run.bossRetryMusic == BossRetryMusic::Keep;
+            }
+            if (run.retry != Retry::Restoring)
+                return false;
+
+            slot = 0;
+            run.deferredStageMusic = run.holdMidbossMusic || run.stageMusicPosition >= 0.001;
+            return run.deferredStageMusic;
+        }
+
+        static bool IsStageLoadMusic(uintptr_t caller)
+        {
+            return caller == 0x4369a1 || caller == 0x436b83;
+        }
+
+        static bool KeepMusicDuringRebuild()
+        {
+            return run.bossRetryMusic == BossRetryMusic::Keep
+                && (run.retry == Retry::Covering || RetryRebuilding());
+        }
+
+        static bool KeepRetryMusicForPlay(int slot, uintptr_t caller)
+        {
+            return run.bossRetryMusic == BossRetryMusic::Keep
+                && (IsStageLoadMusic(caller) || (slot == 1 && KeepMusicDuringRebuild()));
+        }
+
+        static bool KeepRetryMusicForStop(uintptr_t caller)
+        {
+            return run.bossRetryMusic == BossRetryMusic::Keep
+                && (caller == 0x436b74 || (caller == 0x435fe0 && KeepMusicDuringRebuild()));
+        }
+
+        static bool SuppressRetryMusicCommand(PCONTEXT ctx)
+        {
+            const auto args = reinterpret_cast<int32_t*>(ctx->Esp);
+            switch (args[0]) {
+            case 0x44572f: // PlayBGM queues a WAV stop before play.
+                return KeepRetryMusicForPlay(GetMemContent<int>(ctx->Ebp + 8), GetMemContent(ctx->Ebp + 4));
+            case 0x445743: {
+                const auto caller = GetMemContent(ctx->Ebp + 4);
+                return (IsStageLoadMusic(caller) && RouteStageMusic(args[2]))
+                    || KeepRetryMusicForPlay(args[2], caller);
+            }
+            case 0x445836:
+            case 0x44582c:
+                return KeepRetryMusicForStop(args[4]);
+            default:
+                return false;
+            }
+        }
+    }
+
+    static bool IsSpellPractice()
+    {
+        return thPracParam.mode == 2 || (GetMemContent<unsigned>(0x4f58b8) & 0x30) == 0x20;
+    }
+
+    static uintptr_t __fastcall SpawnBombFragmentPair(uintptr_t manager, void*, int itemType,
+        const float* position, uint32_t unused, float angle, float speed, int delay)
+    {
+        constexpr float angleOffset = 0.18f;
+        const auto first = spawnItem(manager, bombFragmentItem, position, unused, angle - angleOffset, speed, delay);
+        if (first) {
+            // The native spawner advances the cycle only for a successfully created type 12 item.
+            if (itemType == cycleRewardItem)
+                ++*reinterpret_cast<int*>(BONUS_TOTAL);
+            spawnItem(manager, bombFragmentItem, position, unused, angle + angleOffset, speed, delay);
+        }
+        return first;
+    }
+
+    static ImTextureID LoadHudImage(int resourceId)
+    {
+        const auto module = reinterpret_cast<HMODULE>(&__ImageBase);
+        const auto resource = FindResourceW(module, MAKEINTRESOURCEW(resourceId), RT_RCDATA);
+        if (!resource)
+            return {};
+        const auto data = static_cast<const char*>(LockResource(LoadResource(module, resource)));
+        if (!data)
+            return {};
+        return ReadImage(9, GetMemContent<DWORD>(0x4d8f68), nullptr, data, SizeofResource(module, resource));
+    }
+
+    static constexpr LONG retryLeft = 32, retryRight = 416, retryTop = 16, retryBottom = 464;
+    static constexpr float promptCenterX = 224.0f, promptCenterY = 218.0f;
+
+    static void RenderRetry(ImDrawList* draw)
+    {
+        using namespace Pointdevice;
+        const auto phase = run.retry;
+        if (phase == Retry::Playing && (!pointdeviceRun || !GetMemContent(PLAYER_PTR)))
+            return;
+
+        const auto now = GetTickCount64();
+        static const auto background = LoadHudImage(IDR_TH14_RETRY_BACKGROUND);
+        static const auto labels = LoadHudImage(IDR_TH14_RETRY_LABELS);
+        static const auto sweep = LoadHudImage(IDR_TH14_RETRY_SWEEP);
+        static const auto glow = LoadHudImage(IDR_TH14_RETRY_GLOW);
+        if (phase == Retry::Playing)
+            return; // Load the textures on entry to gameplay, before the first Miss.
+        const auto screen = ImGui::GetIO().DisplaySize;
+        const auto position = [&](float x, float y) {
+            return ImVec2(x * screen.x / 640.0f, y * screen.y / 480.0f);
+        };
+        const auto tint = [](float opacity) {
+            return IM_COL32(255, 255, 255, static_cast<int>(opacity * 255.0f + 0.5f));
+        };
+
+        const auto elapsed = RetryElapsed(now);
+        run.retryFrameDrawn = true;
+        draw->PushClipRect(position(retryLeft, retryTop), position(retryRight, retryBottom), true);
+
+        struct SpriteBounds {
+            float left, top, right, bottom;
+        };
+        // Pixel bounds in the original TH15 front03.png.
+        constexpr SpriteBounds ready { 6, 2, 188, 63 };
+        constexpr SpriteBounds go { 2, 75, 125, 118 };
+        constexpr SpriteBounds restart { 24, 146, 230, 189 };
+        const auto& sprite = phase == Retry::Ready ? ready : phase == Retry::Go ? go : restart;
+        float opacity = 1.0f;
+        float scale = 1.0f;
+        if (phase == Retry::Ready) {
+            opacity = RetryPulseOpacity(elapsed, readyPulseMs);
+        } else if (phase == Retry::Go) {
+            const float arrival = EaseRetry(elapsed / 90.0f);
+            const float fade = 1.0f - EaseRetry((static_cast<float>(elapsed) - 200.0f) / (goDurationMs - 200.0f));
+            opacity = arrival * fade;
+            scale = 0.82f + 0.27f * arrival - 0.09f * EaseRetry(elapsed / 180.0f);
+            const float radius = 23.0f + 33.0f * EaseRetry(elapsed / 300.0f);
+            if (glow) {
+                draw->AddImage(glow, position(promptCenterX - radius, promptCenterY - radius),
+                    position(promptCenterX + radius, promptCenterY + radius), { 0, 0 }, { 1, 1 }, tint(0.55f * opacity));
+            }
+        } else {
+            const float coverage = phase == Retry::Covering
+                ? EaseRetry(static_cast<float>(elapsed) / coverInMs) : 1.0f;
+            run.coverFrameDrawn = phase == Retry::Covering && elapsed >= coverInMs;
+            const float edge = retryTop + (retryBottom - retryTop) * coverage;
+            if (coverage > 0.0f) {
+                if (background)
+                    draw->AddImage(background, position(retryLeft, retryTop), position(retryRight, edge), { 0, 0 }, { 1, coverage });
+                else
+                    draw->AddRectFilled(position(retryLeft, retryTop), position(retryRight, edge), IM_COL32(40, 19, 53, 255));
+            }
+            if (sweep && coverage > 0.0f && coverage < 1.0f) {
+                const float intensity = 2.8f * coverage * (1.0f - coverage);
+                draw->AddImage(sweep, position(retryLeft, edge - 13.0f), position(retryRight, edge + 13.0f),
+                    { 0, 0 }, { 1, 1 }, IM_COL32(223, 192, 255, static_cast<int>(255.0f * intensity)));
+            }
+            opacity = EaseRetry((coverage - 0.52f) / 0.34f) * RestartOpacity(now);
+        }
+
+        if (labels && opacity > 0.0f) {
+            const float halfWidth = (sprite.right - sprite.left) * scale / 4.0f;
+            const float halfHeight = (sprite.bottom - sprite.top) * scale / 4.0f;
+            draw->AddImage(labels, position(promptCenterX - halfWidth, promptCenterY - halfHeight),
+                position(promptCenterX + halfWidth, promptCenterY + halfHeight),
+                { sprite.left / 256.0f, sprite.top / 192.0f },
+                { sprite.right / 256.0f, sprite.bottom / 192.0f }, tint(opacity));
+        }
+        draw->PopClipRect();
+    }
+
+    static Microsoft::WRL::ComPtr<IDirect3DSurface9> retryBackdrop;
+
+    static void CaptureRetryBackdrop(IDirect3DDevice9* device)
+    {
+        Microsoft::WRL::ComPtr<IDirect3DSurface9> backBuffer;
+        D3DSURFACE_DESC desc {};
+        if (FAILED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, backBuffer.GetAddressOf()))
+            || FAILED(backBuffer->GetDesc(&desc))
+            || FAILED(device->CreateRenderTarget(desc.Width, desc.Height, desc.Format, desc.MultiSampleType,
+                desc.MultiSampleQuality, FALSE, retryBackdrop.ReleaseAndGetAddressOf(), nullptr)))
+            return;
+        if (FAILED(device->StretchRect(backBuffer.Get(), nullptr, retryBackdrop.Get(), nullptr, D3DTEXF_NONE)))
+            retryBackdrop.Reset();
+    }
+
+    static bool RestoreRetryHud(IDirect3DDevice9* device)
+    {
+        Microsoft::WRL::ComPtr<IDirect3DSurface9> backBuffer;
+        D3DSURFACE_DESC desc {};
+        if (!retryBackdrop
+            || FAILED(device->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, backBuffer.GetAddressOf()))
+            || FAILED(backBuffer->GetDesc(&desc)))
+            return false;
+
+        // Preserve the frame outside the playfield while the native HUD rebuilds.
+        // The newly drawn playfield can then show the current Restart pulse.
+        const auto width = static_cast<LONG>(desc.Width), height = static_cast<LONG>(desc.Height);
+        const LONG left = retryLeft * width / 640, right = retryRight * width / 640;
+        const LONG top = retryTop * height / 480, bottom = retryBottom * height / 480;
+        const RECT margins[] {
+            { 0, 0, width, top }, { 0, bottom, width, height },
+            { 0, top, left, bottom }, { right, top, width, bottom },
+        };
+        for (const auto& margin : margins) {
+            if (FAILED(device->StretchRect(retryBackdrop.Get(), &margin, backBuffer.Get(), &margin, D3DTEXF_NONE)))
+                return false;
+        }
+        return true;
+    }
+
+    static void PresentRetryFrame(PCONTEXT ctx, bool clearOnly = false)
+    {
+        using namespace Pointdevice;
+        const bool rebuilding = RetryRebuilding();
+        if (!rebuilding && !run.coverFrameDrawn)
+            retryBackdrop.Reset();
+        if (run.retry == Retry::Playing)
+            return;
+
+        const auto device = GetMemContent<IDirect3DDevice9*>(0x4d8f68);
+        const auto now = GetTickCount64();
+        if (clearOnly || (rebuilding && (!run.retryFrameDrawn || !RestoreRetryHud(device)))) {
+            ctx->Eax = clearOnly ? D3D_OK : device->TestCooperativeLevel();
+            RetryPresented(now, false);
+        } else {
+            if (run.coverFrameDrawn)
+                CaptureRetryBackdrop(device);
+            const auto result = device->Present(nullptr, nullptr, nullptr, nullptr);
+            ctx->Eax = result;
+            RetryPresented(GetTickCount64(), SUCCEEDED(result));
+        }
+        // The five D3D9 Present arguments have already been pushed at each site.
+        ctx->Esp += 5 * sizeof(DWORD);
+        ctx->Eip += 3;
+    }
+
+    static void RenderDisabledLifeSlot(ImDrawList* draw)
+    {
+        if (!pointdeviceRun || !GetMemContent(PLAYER_PTR) || THGuiRep::singleton().mRepStatus)
+            return;
+        const auto hud = GetMemContent(0x4db550);
+        if (!hud || !GetMemContent(hud + 0x58))
+            return;
+
+        static const auto texture = LoadHudImage(IDR_TH14_LIFE_DISABLED);
+        if (!texture)
+            return;
+
+        // Match the rendered life row in 1280x960 space, accounting for PNG padding.
+        constexpr float centerX = 1137.0f;
+        constexpr float centerY = 220.0f;
+        constexpr float width = 280.0f;
+        constexpr float height = width * 84.0f / 430.0f;
+        const auto screen = ImGui::GetIO().DisplaySize;
+        const float x = screen.x / 1280.0f;
+        const float y = screen.y / 960.0f;
+        draw->AddImage(texture, { (centerX - width / 2) * x, (centerY - height / 2) * y },
+            { (centerX + width / 2) * x, (centerY + height / 2) * y });
+    }
+
+    static void RenderChapterFinish(ImDrawList* draw)
+    {
+        const auto startedAt = Pointdevice::run.chapterFinishStartedAt;
+        if (!startedAt)
+            return;
+        const float opacity = Pointdevice::ChapterFinishOpacity(GetTickCount64() - startedAt);
+        if (opacity <= 0.0f)
+            return;
+        static const auto texture = LoadHudImage(IDR_TH14_CHAPTER_FINISH);
+        if (!texture)
+            return;
+
+        // Chapter Finish cropped from TH15's front02.png.
+        const auto screen = ImGui::GetIO().DisplaySize;
+        const float x = screen.x / 640.0f, y = screen.y / 480.0f;
+        constexpr float halfWidth = 171.0f * 0.8f / 2, halfHeight = 31.0f * 0.8f / 2;
+        draw->AddImage(texture, { (promptCenterX - halfWidth) * x, (promptCenterY - halfHeight) * y },
+            { (promptCenterX + halfWidth) * x, (promptCenterY + halfHeight) * y },
+            { 0, 0 }, { 1, 1 }, IM_COL32(255, 255, 255, static_cast<int>(opacity * 255.0f + 0.5f)));
     }
 
     int THBGMTest()
@@ -3100,16 +4484,21 @@ namespace TH14 {
         }
     })
     EHOOK_DY(th14_everlasting_bgm, 0x46ef90, 1, {
-        int32_t retn_addr = ((int32_t*)pCtx->Esp)[0];
-        int32_t bgm_cmd = ((int32_t*)pCtx->Esp)[1];
-        int32_t bgm_id = ((int32_t*)pCtx->Esp)[2];
-        // 4th stack item = i32 call_addr
+        auto args = reinterpret_cast<int32_t*>(pCtx->Esp);
+        const int32_t retn_addr = args[0];
+        const int32_t bgm_cmd = args[1];
+        auto& bgm_id = args[2];
+
+        if (Pointdevice::SuppressRetryMusicCommand(pCtx)) {
+            pCtx->Eip = 0x46f022;
+            return;
+        }
 
         bool el_switch;
         bool is_practice;
         bool result;
 
-        el_switch = *(THOverlay::singleton().mElBgm) && !THGuiRep::singleton().mRepStatus && thPracParam.mode == 1 && thPracParam.section;
+        el_switch = *(THOverlay::singleton().mElBgm) && !pointdeviceRun && !THGuiRep::singleton().mRepStatus && thPracParam.mode == 1 && thPracParam.section;
         is_practice = (*((int32_t*)0x4f58b8) & 0x1); // is restarting
         result = ElBgmTest<0x445743, 0x436526, 0x448e91, 0x44908a, 0xffffffff>(
             el_switch, is_practice, retn_addr, bgm_cmd, bgm_id, 0xffffffff);
@@ -3118,8 +4507,25 @@ namespace TH14 {
             pCtx->Eip = 0x46f022;
         }
     })
+    EHOOK_DY(th14_pointdevice_bgm_stop, 0x436506, 7, {
+        if (Pointdevice::KeepMusicDuringRebuild())
+            pCtx->Eip = 0x43652d;
+    })
+    EHOOK_DY(th14_pointdevice_bgm_seek, 0x46e915, 5, {
+        Pointdevice::SeekStageMusic(pCtx);
+    })
+    EHOOK_DY(th14_pointdevice_hold_midboss_bgm, 0x46e637, 2, {
+        // This is the BGM queue consumer, including commands queued before Miss.
+        if (Pointdevice::HoldMidbossMusicCommand(GetMemContent<int>(pCtx->Edi))) {
+            pCtx->Ebx = 0;
+            pCtx->Eip = 0x46e8cc; // Drop the command and advance the queue.
+        }
+    })
     EHOOK_DY(th14_param_reset, 0x45a111, 7, {
         thPracParam.Reset();
+        Pointdevice::Reset();
+        pointdeviceRun = false;
+        pointdeviceLocked = false;
         THAdvOptWnd::singleton().ToggleLock(false);
     })
     EHOOK_DY(th14_prac_menu_1, 0x45e768, 7, {
@@ -3131,6 +4537,8 @@ namespace TH14 {
     })
     EHOOK_DY(th14_prac_menu_3, 0x45ea9f, 7, {
         THGuiPrac::singleton().State(3);
+        pointdeviceRun = pointdeviceEnabled;
+        pointdeviceLocked = true;
         THAdvOptWnd::singleton().ToggleLock(true);
     })
     EHOOK_DY(th14_prac_menu_4, 0x45eb40, 7, {
@@ -3152,6 +4560,12 @@ namespace TH14 {
         }
     })
     EHOOK_DY(th14_patch_main, 0x4360ce, 1, {
+        const bool spellPractice = IsSpellPractice();
+        if (!pointdeviceLocked && !THGuiRep::singleton().mRepStatus
+            && (thPracParam.mode == 1 || spellPractice))
+            pointdeviceRun = pointdeviceEnabled;
+        pointdeviceLocked = true;
+        PracticeEdits edits;
         if (thPracParam.mode == 1) {
             *(int32_t*)(0x4f5830) = (int32_t)(thPracParam.score / 10);
             *(int32_t*)(0x4f5864) = thPracParam.life;
@@ -3163,13 +4577,37 @@ namespace TH14 {
             *(int32_t*)(0x4f584c) = thPracParam.value * 100;
             *(int32_t*)(0x4f5840) = thPracParam.graze; // 0x4E7420: Chapter Graze
 
-            THSectionPatch();
+            const auto& run = Pointdevice::run;
+            const auto stage = GetMemContent<unsigned>(STAGE_NUM);
+            const bool track = Pointdevice::IsStoryStage(stage);
+            const bool retrying = track && run.retry == Pointdevice::Retry::Requested && run.stage == stage;
+            if (!retrying || run.checkpoint == run.practiceEntry)
+                THSectionPatch(track ? &edits : nullptr);
         } else if (thPracParam.mode == 2) {
-            ECLHelper ecl;
-            ecl.SetBaseAddr((void*)GetMemAddr(0x4db544, 0xcc, 0xC));
+            PracticeECL ecl((void*)GetMemAddr(0x4db544, 0xcc, 0xC));
             THPatchSP(ecl);
         }
+        if (!spellPractice)
+            Pointdevice::InitStage(std::move(edits));
+        else
+            Pointdevice::Reset();
         thPracParam._playLock = true;
+    })
+    EHOOK_DY(th14_pointdevice_ecl_marker, 0x483b3a, 2, {
+        Pointdevice::EclMarker(pCtx);
+    })
+    EHOOK_DY(th14_pointdevice_ecl_hold, 0x48238e, 2, {
+        // Other VMs in the current enemy update can still run after the checkpoint.
+        if (Pointdevice::run.retry == Pointdevice::Retry::Ready)
+            pCtx->Eip = 0x483cf6;
+        else
+            Pointdevice::FastForwardStageStart(pCtx->Ecx);
+    })
+    EHOOK_DY(th14_pointdevice_stage_loaded, 0x436baa, 4, {
+        Pointdevice::TrackStageLoad(GetMemContent<uint32_t>(pCtx->Edi + 0x80));
+    })
+    EHOOK_DY(th14_pointdevice_stage_exit, 0x4360e0, 1, {
+        Pointdevice::UnpatchStage();
     })
     EHOOK_DY(th14_bgm, 0x43699a, 2, {
         if (THBGMTest()) {
@@ -3177,9 +4615,13 @@ namespace TH14 {
             pCtx->Eip = 0x43699c;
         }
     }) EHOOK_DY(th14_on_restart, 0x447810, 5, {
+        Pointdevice::SelectRestartStage(pCtx);
+        TH14InGameInfo::singleton().OnRestart();
         THAdvOptWnd::singleton().ToggleLock(true);
     })
     EHOOK_DY(th14_normal_game_enter, 0x45e63e, 8, {
+        pointdeviceRun = pointdeviceEnabled && !pointdeviceLocked;
+        pointdeviceLocked = true;
         THAdvOptWnd::singleton().ToggleLock(true);
     }) EHOOK_DY(th14_rep_save, 0x455bf2, 5, {
         char* repName = (char*)(pCtx->Esp + 0x38);
@@ -3212,6 +4654,21 @@ namespace TH14 {
             pCtx->Eip = 0x464068;
         }
     })
+    EHOOK_DY(th14_pointdevice_before_update, 0x4012b0, 3, {
+        if (Pointdevice::AdvanceRetry(GetTickCount64()))
+            pCtx->Eip = 0x40135c; // Return success without running update callbacks.
+    })
+    EHOOK_DY(th14_pointdevice_keyboard, 0x401d0f, 7, {
+        Pointdevice::FilterRetryKeyboard(pCtx, Pointdevice::retryVirtualKeys);
+    })
+    EHOOK_DY(th14_pointdevice_directinput, 0x401ee7, 7, {
+        Pointdevice::FilterRetryKeyboard(pCtx, Pointdevice::retryScanCodes);
+    })
+    EHOOK_DY(th14_pointdevice_after_callback, 0x401313, 3, {
+        // Miss and checkpoint restoration can start a freeze inside a callback.
+        if (Pointdevice::RetryFreezesGameplay())
+            pCtx->Eip = 0x40135c;
+    })
     EHOOK_DY(th14_update, 0x40138a, 1, {
         GameGuiBegin(IMPL_WIN32_DX9, !THAdvOptWnd::singleton().IsOpen());
 
@@ -3243,6 +4700,8 @@ namespace TH14 {
             KeysHUD(14, { 1280.0f, 0.0f }, { 840.0f, 0.0f }, g_adv_igi_options.keyboard_style);
 
         RenderLockTimer(p);
+        RenderDisabledLifeSlot(p);
+        RenderChapterFinish(p);
         GameUpdateOuter(p, 14);
 
         bool drawCursor = THAdvOptWnd::StaticUpdate() || THGuiPrac::singleton().IsOpen() || THGuiSP::singleton().IsOpen();
@@ -3254,61 +4713,80 @@ namespace TH14 {
             RecordKey(14, *(DWORD*)(0x004D6A90));
     }) 
     EHOOK_DY(th14_render, 0x40149a, 1, {
+        if (GameGuiProgress == 2)
+            RenderRetry(ImGui::GetOverlayDrawList());
         GameGuiRender(IMPL_WIN32_DX9);
+    })
+    EHOOK_DY(th14_retry_present, 0x46a68a, 3, {
+        PresentRetryFrame(pCtx);
+    })
+    EHOOK_DY(th14_retry_present_alternate, 0x46a8e6, 3, {
+        PresentRetryFrame(pCtx);
+    })
+    EHOOK_DY(th14_retry_present_fixed_rate, 0x46aafc, 3, {
+        PresentRetryFrame(pCtx);
+    })
+    EHOOK_DY(th14_retry_present_clear, 0x46c322, 3, {
+        PresentRetryFrame(pCtx, true);
+    })
+    EHOOK_DY(th14_retry_present_clear_second, 0x46c368, 3, {
+        PresentRetryFrame(pCtx, true);
+    })
+    EHOOK_DY(th14_retry_release_backdrop, 0x447720, 6, {
+        retryBackdrop.Reset();
     })
     HOOKSET_ENDDEF()
 
     HOOKSET_DEFINE(THInGameInfo)
+    EHOOK_DY(th14_pointdevice_reward, 0x4397b0, 4, {
+        if (pointdeviceRun) {
+            const int itemType = GetMemContent<int>(pCtx->Esp + 4);
+            if (itemType == lifeFragmentItem
+                || (itemType == cycleRewardItem && GetMemContent<int>(BONUS_TOTAL) % 5 == 4))
+                pCtx->Eip = reinterpret_cast<uintptr_t>(SpawnBombFragmentPair);
+        }
+    })
     EHOOK_DY(th14_game_start, 0x4375BE,7, // gamestart-bomb set
     {
-        TH14InGameInfo::singleton().mBombCount = 0;
-        TH14InGameInfo::singleton().mMissCount = 0;
-        TH14InGameInfo::singleton().m05Count = 0;
-        TH14InGameInfo::singleton().m08Count = 0;
-        TH14InGameInfo::singleton().m12Count = 0;
-        TH14InGameInfo::singleton().m16Count = 0;
-        TH14InGameInfo::singleton().m20Count = 0;
+        TH14InGameInfo::singleton().OnGameStart();
     })
     EHOOK_DY(th14_bomb_dec, 0x41218A,5, // bomb dec
     {
-        TH14InGameInfo::singleton().mBombCount++;
+        ++chapterCounts.bombsUsed;
     })
     EHOOK_DY(th14_life_dec, 0x44F618,5, // life dec
     {
         TH14InGameInfo::singleton().mMissCount++;
-        FastRetry(thPracParam.mode);
+        if (!Pointdevice::RequestRetry(pCtx))
+            FastRetry(thPracParam.mode, pointdeviceRun && (thPracParam.mode == 1 || IsSpellPractice()));
     })
     EHOOK_DY(th14_get_item, 0x438DF8,6,
     {
         int item_cnt = *(int32_t*)(0x4F5880);
         if (item_cnt >= 60)
-            TH14InGameInfo::singleton().m20Count++;
+            ++chapterCounts.bonus20;
         else if (item_cnt >= 50)
-            TH14InGameInfo::singleton().m16Count++;
+            ++chapterCounts.bonus16;
         else if (item_cnt >= 40)
-            TH14InGameInfo::singleton().m12Count++;
+            ++chapterCounts.bonus12;
         else if (item_cnt >= 30)
-            TH14InGameInfo::singleton().m08Count++;
+            ++chapterCounts.bonus08;
         else if (item_cnt >= 20)
-            TH14InGameInfo::singleton().m05Count++;
+            ++chapterCounts.bonus05;
     })
     EHOOK_DY(th14_lock_timer1, 0x42EC6B,10, // initialize
     {
         g_lock_timer = 0;
     })
-    EHOOK_DY(th14_lock_timer2, 0x4288B6,4, // spell case 522/528/537/538/539
+    EHOOK_DY(th14_lock_timer2, 0x4286BA,4, // SetNextPattern case 514
     {
         g_lock_timer = 0;
     })
-    EHOOK_DY(th14_lock_timer3, 0x4289EA,5, // spellEnd case 523
+    EHOOK_DY(th14_lock_timer3, 0x427888,2, // set boss mode case 512
     {
         g_lock_timer = 0;
     })
-    EHOOK_DY(th14_lock_timer4, 0x427888,2, // set boss mode case 512
-    {
-        g_lock_timer = 0;
-    })
-    EHOOK_DY(th14_lock_timer5, 0x42C0D4,6, // decrease time (update)
+    EHOOK_DY(th14_lock_timer4, 0x42C0D4,6, // decrease time (update)
     {
         g_lock_timer_flag = true;
     })
@@ -3322,6 +4800,11 @@ namespace TH14 {
         GameGuiInit(IMPL_WIN32_DX9, 0x4d8f68, WINDOW_PTR,
             Gui::INGAGME_INPUT_GEN2, 0x4d6884, 0x4d6880, 0,
             (*((int32_t*)0x4f7a54) >> 2) & 0xf);
+        // Keep TH14 menu shortcuts off graphics wrappers' GetAsyncKeyState hooks.
+        Gui::KeyboardInputUseWindowMessages();
+        const auto windowThread = GetWindowThreadProcessId(GetMemContent<HWND>(WINDOW_PTR), nullptr);
+        if (windowThread)
+            pointdeviceKeyHookInstalled = SetWindowsHookExW(WH_GETMESSAGE, PointdeviceKeyHook, nullptr, windowThread) != nullptr;
 
         SetDpadHook(0x401A8E, 3);
         // Gui components creation

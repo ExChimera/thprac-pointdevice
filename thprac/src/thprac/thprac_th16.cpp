@@ -1,6 +1,7 @@
 ﻿#include "thprac_games.h"
 #include "thprac_utils.h"
 #include <format>
+#include <array>
 
 
 namespace THPrac {
@@ -12,6 +13,10 @@ namespace TH16 {
         ENEMY_MANAGER_PTR = 0x4a6dc0,
         PLAYER_PTR = 0x4a6ef8,
     };
+
+    static bool pointdeviceEnabled = false;
+    static bool pointdeviceRun = false;
+    static bool pointdeviceLocked = false;
 
     int g_lock_timer = 0;
     bool g_lock_timer_flag = false;
@@ -491,9 +496,14 @@ namespace TH16 {
             mElBgm();
             mInGameInfo();
             mEnemyMuteki();
+            ImGui::Text("Pointdevice [P]: %s%s (Stage 1)",
+                (pointdeviceLocked ? pointdeviceRun : pointdeviceEnabled) ? "On" : "Off",
+                pointdeviceLocked ? " (locked)" : "");
         }
         virtual void OnPreUpdate() override
         {
+            if (Gui::KeyboardInputUpdate('P') == 1 && !pointdeviceLocked)
+                pointdeviceEnabled = !pointdeviceEnabled;
             if (mMenu(false) && !ImGui::IsAnyItemActive()) {
                 if (*mMenu) {
                     Open();
@@ -2350,8 +2360,162 @@ namespace TH16 {
         }
     }
 
+    namespace Pointdevice {
+        enum class Retry { Playing, Requested, Restoring };
+        struct Checkpoint {
+            unsigned file;
+            unsigned offset;
+            unsigned stageDestination;
+            unsigned phaseFrom = 0;
+            unsigned phaseDestination = 0;
+        };
+        // Japanese 1.00a. Retain normal story drops and phase transitions.
+        static constexpr Checkpoint checkpoints[] {
+            { 0, 0x54b4, 0x7df8 }, // opening
+            { 0, 0x5b14, 0x7df8, 0x5070, 0x50a4 },
+            { 3, 0x0094, 0x7e50 }, // midboss
+            { 0, 0x6694, 0x7e94, 0x5160, 0x51d0 },
+            { 2, 0x0628, 0x7f14 }, // nonspell 1
+            { 2, 0x1b00, 0x7f14, 0x03cc, 0x04b4 },
+            { 2, 0x0f40, 0x7f14, 0x0628, 0x0f40 },
+            { 2, 0x26d0, 0x7f14, 0x03cc, 0x0598 },
+        };
+        static constexpr uintptr_t resourceAddresses[] {
+            0x4a57b0, 0x4a57b4, 0x4a57c0, 0x4a57d8,
+            0x4a57e4, 0x4a57f4, 0x4a57f8, 0x4a57fc,
+            0x4a5800, 0x4a5804, 0x4a5808,
+        };
+        static struct {
+            Retry retry = Retry::Playing;
+            int checkpoint = -1;
+            int practiceEntry = -1;
+            std::array<uintptr_t, 4> files {};
+            std::array<uint32_t, elementsof(resourceAddresses)> resources {};
+            std::array<uint8_t, 20> playerPosition {}; // xyz and fixed-point xy
+            bool hasPlayer = false;
+            ULONGLONG chapterClearUntil = 0;
+        } run;
+
+        static bool Active()
+        {
+            return pointdeviceRun && GetMemContent<unsigned>(STAGE_NUM) == 1
+                && thPracParam.mode <= 1 && !THGuiRep::singleton().mRepStatus
+                && (GetMemContent<unsigned>(0x4a5bec) & 0x30) != 0x20;
+        }
+
+        static void InitStage()
+        {
+            if (!pointdeviceLocked) {
+                pointdeviceRun = pointdeviceEnabled && !THGuiRep::singleton().mRepStatus;
+                pointdeviceLocked = true;
+            }
+            if (!Active()) {
+                run = {};
+                return;
+            }
+            const bool retrying = run.retry == Retry::Requested;
+            if (!retrying)
+                run = {};
+            const auto loader = GetMemContent(ENEMY_MANAGER_PTR, 0x17c);
+            if (!loader)
+                return;
+            for (unsigned i = 0; i < run.files.size(); ++i)
+                run.files[i] = GetMemContent(loader + 0xc + i * 4);
+            // Refuse a different ECL revision instead of routing into arbitrary code.
+            for (const auto& checkpoint : checkpoints) {
+                if (!run.files[checkpoint.file]
+                    || GetMemContent<uint16_t>(run.files[checkpoint.file] + checkpoint.offset + 4) != 40) {
+                    run = {};
+                    return;
+                }
+            }
+            if (retrying)
+                run.retry = Retry::Restoring;
+        }
+
+        static void Reach(int index)
+        {
+            const bool restoring = run.retry == Retry::Restoring;
+            if (restoring ? index != run.checkpoint : index <= run.checkpoint)
+                return;
+            for (size_t i = 0; i < run.resources.size(); ++i) {
+                auto& value = *reinterpret_cast<uint32_t*>(resourceAddresses[i]);
+                if (restoring)
+                    value = run.resources[i];
+                else
+                    run.resources[i] = value;
+            }
+            const auto player = GetMemContent(PLAYER_PTR);
+            if (!restoring)
+                run.hasPlayer = player != 0;
+            if (player && run.hasPlayer) {
+                if (restoring)
+                    std::memcpy(reinterpret_cast<void*>(player + 0x610), run.playerPosition.data(), sizeof(run.playerPosition));
+                else
+                    std::memcpy(run.playerPosition.data(), reinterpret_cast<void*>(player + 0x610), sizeof(run.playerPosition));
+            }
+            if (restoring) {
+                if (const auto hud = GetMemContent(0x4a6dcc)) {
+                    using UpdateCounter = void(__thiscall*)(uintptr_t, int, int);
+                    reinterpret_cast<UpdateCounter>(0x42c280)(hud, GetMemContent<int>(0x4a57f4), GetMemContent<int>(0x4a57f8));
+                    reinterpret_cast<UpdateCounter>(0x42c390)(hud, GetMemContent<int>(0x4a5800), GetMemContent<int>(0x4a5804));
+                }
+            } else {
+                if (run.checkpoint >= 0)
+                    run.chapterClearUntil = GetTickCount64() + 1500;
+                if (run.checkpoint < 0 && thPracParam.mode == 1)
+                    run.practiceEntry = index;
+            }
+            run.checkpoint = index;
+            run.retry = Retry::Playing;
+        }
+
+        static void Dispatch(PCONTEXT ctx)
+        {
+            if (!run.files[0] || !Active() || run.retry == Retry::Requested)
+                return;
+            auto ip = static_cast<uintptr_t>(ctx->Esi);
+            if (run.retry == Retry::Restoring && run.checkpoint != run.practiceEntry) {
+                const auto& checkpoint = checkpoints[run.checkpoint];
+                uintptr_t destination = 0;
+                if (ip == run.files[0] + 0x7df8)
+                    destination = run.files[0] + checkpoint.stageDestination;
+                if (checkpoint.phaseFrom && ip == run.files[checkpoint.file] + checkpoint.phaseFrom)
+                    destination = run.files[checkpoint.file] + checkpoint.phaseDestination;
+                if (destination && destination != ip) {
+                    // VM stores a subroutine-relative offset, unlike TH14's raw IP.
+                    *reinterpret_cast<int32_t*>(ctx->Edi + 8) += static_cast<int32_t>(destination - ip);
+                    *reinterpret_cast<float*>(ctx->Edi) = GetMemContent<int32_t>(destination);
+                    ctx->Esi = destination;
+                    *reinterpret_cast<uintptr_t*>(ctx->Esp + 0xc) = destination;
+                    ip = destination;
+                }
+            }
+            for (int i = 0; i < elementsof(checkpoints); ++i) {
+                if (ip == run.files[checkpoints[i].file] + checkpoints[i].offset) {
+                    Reach(i);
+                    return;
+                }
+            }
+        }
+
+        static bool RequestRetry(PCONTEXT ctx)
+        {
+            if (!Active() || !run.files[0] || run.checkpoint < 0)
+                return false;
+            run.retry = Retry::Requested;
+            run.chapterClearUntil = 0;
+            *reinterpret_cast<int32_t*>(0x4c17c4) = 10; // native restart
+            ctx->Eax = GetMemContent<unsigned>(0x4a57f4);
+            return true;
+        }
+    }
+
     int THBGMTest()
     {
+        if (Pointdevice::run.retry == Pointdevice::Retry::Restoring
+            && Pointdevice::run.checkpoint >= 4)
+            return 1;
         if (!thPracParam.mode)
             return 0;
         else if (thPracParam.section >= 10000)
@@ -2518,6 +2682,9 @@ namespace TH16 {
         }
     })
     EHOOK_DY(th16_param_reset, 0x44b610, 7, {
+        Pointdevice::run = {};
+        pointdeviceRun = false;
+        pointdeviceLocked = false;
         thPracParam.Reset();
         thSubSeasonB = -1;
     })
@@ -2650,7 +2817,11 @@ namespace TH16 {
             ecl.SetBaseAddr((void*)GetMemAddr(0x4a6dc0, 0x17c, 0xC));
             THPatchSP(ecl);
         }
+        Pointdevice::InitStage();
         thPracParam._playLock = true;
+    })
+    EHOOK_DY(th16_pointdevice_dispatch, 0x4720a0, 3, {
+        Pointdevice::Dispatch(pCtx);
     })
     EHOOK_DY(th16_bgm, 0x42de8c, 2, {
         if (THBGMTest()) {
@@ -2719,6 +2890,12 @@ namespace TH16 {
         if (g_adv_igi_options.show_keyboard_monitor && GetMemContent(PLAYER_PTR))
             KeysHUD(16, { 1280.0f, 0.0f }, { 840.0f, 0.0f }, g_adv_igi_options.keyboard_style);
 
+        if (GetTickCount64() < Pointdevice::run.chapterClearUntil) {
+            const auto screen = ImGui::GetIO().DisplaySize;
+            const auto bounds = ImGui::CalcTextSize("Chapter Clear");
+            p->AddText(ImVec2((screen.x - bounds.x) / 2, screen.y / 2),
+                IM_COL32(255, 243, 185, 255), "Chapter Clear");
+        }
         RenderLockTimer(p);
         GameUpdateOuter(p, 16);
 
@@ -2749,7 +2926,8 @@ namespace TH16 {
     EHOOK_DY(th16_life_dec, 0x443D3A,5, // life dec
     {
         TH16InGameInfo::singleton().mMissCount++;
-        FastRetry(thPracParam.mode);
+        if (!Pointdevice::RequestRetry(pCtx))
+            FastRetry(thPracParam.mode);
     })
     EHOOK_DY(th16_release, 0x40DC8A,10,
     {

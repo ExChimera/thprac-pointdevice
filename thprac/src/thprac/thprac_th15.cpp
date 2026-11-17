@@ -538,6 +538,7 @@ namespace TH15 {
             mAutoBomb.SetTextOffsetRel(x_offset_1, x_offset_2);
             mElBgm.SetTextOffsetRel(x_offset_1, x_offset_2);
             mInGameInfo.SetTextOffsetRel(x_offset_1, x_offset_2);
+            mChapterLives.SetTextOffsetRel(x_offset_1, x_offset_2);
             mEnemyMuteki.SetTextOffsetRel(x_offset_1, x_offset_2);
         }
         virtual void OnContentUpdate() override
@@ -550,6 +551,7 @@ namespace TH15 {
             mAutoBomb();
             mElBgm();
             mInGameInfo();
+            mChapterLives();
             mEnemyMuteki();
         }
         virtual void OnPreUpdate() override
@@ -594,6 +596,7 @@ namespace TH15 {
         HOTKEY_ENDDEF();
 
         Gui::GuiHotKey mElBgm { TH_EL_BGM, "F7", VK_F7 };
+        Gui::GuiHotKey mChapterLives { "传统无欠模式", "F9", VK_F9, {} };
         Gui::GuiHotKey mInGameInfo { THPRAC_INGAMEINFO, "F8", VK_F8 };
 
         
@@ -2465,10 +2468,82 @@ namespace TH15 {
     }
 
 
+    struct ChapterRetryState {
+        bool checkpointReady = false;
+        bool pending = false;
+        bool noContinue = false;
+        int32_t lives = 0;
+        int32_t lifeFragments = 0;
+        int32_t bombFragments = 0;
+    };
+    static ChapterRetryState chapterRetry;
+
+    static int32_t& TH15Global(uintptr_t address)
+    {
+        return *reinterpret_cast<int32_t*>(address);
+    }
+
+    static bool ChapterLivesEnabled()
+    {
+        static const bool originalExecutable = [] {
+            wchar_t path[MAX_PATH] {};
+            const DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
+            if (!length || length >= MAX_PATH)
+                return false;
+            const wchar_t* name = wcsrchr(path, L'\\');
+            return _wcsicmp(name ? name + 1 : path, L"th15.exe") == 0;
+        }();
+        const int32_t flags = TH15Global(0x4e7794);
+        // thprac practice uses the Legacy chapter logic with a patched starting section.
+        return originalExecutable && *THOverlay::singleton().mChapterLives
+            && !(flags & 0x300) && (thPracParam.mode == 1 || !(flags & 0x11));
+    }
+
     HOOKSET_DEFINE(THMainHook)
+    EHOOK_DY(th15_chapter_retry_checkpoint, 0x43dd30, 1, {
+        chapterRetry.checkpointReady = true;
+    })
+    EHOOK_DY(th15_chapter_retry_death, 0x454bbd, 5, {
+        if (!ChapterLivesEnabled())
+            return;
+        const int32_t lives = TH15Global(0x4e7450);
+        chapterRetry.noContinue = lives <= 0;
+        if (lives > 0 && chapterRetry.checkpointReady) {
+            chapterRetry.lives = lives - 1;
+            chapterRetry.lifeFragments = TH15Global(0x4e7454);
+            chapterRetry.bombFragments = TH15Global(0x4e7460);
+            chapterRetry.pending = true;
+        }
+    })
+    EHOOK_DY(th15_chapter_retry_preserve_checkpoint, 0x43d08d, 10, {
+        // A chapter boundary on the death frame must not overwrite the checkpoint.
+        if (chapterRetry.pending)
+            pCtx->Eip = 0x43d0ea;
+    })
+    EHOOK_DY(th15_chapter_retry_dispatch, 0x43d0f4, 6, {
+        if (chapterRetry.pending) {
+            using RestoreChapter = void(__thiscall*)(void*);
+            reinterpret_cast<RestoreChapter>(0x43dee0)(reinterpret_cast<void*>(0x4e73f0));
+            chapterRetry.pending = false;
+        }
+    })
+    EHOOK_DY(th15_chapter_retry_resources, 0x43df43, 3, {
+        if (!chapterRetry.pending)
+            return;
+        TH15Global(0x4e7450) = chapterRetry.lives;
+        TH15Global(0x4e7454) = chapterRetry.lifeFragments;
+        TH15Global(0x4e745c) = 3;
+        TH15Global(0x4e7460) = chapterRetry.bombFragments;
+        // Keep the chapter-start power copied from the checkpoint.
+        pCtx->Eip = 0x43df46;
+    })
+    EHOOK_DY(th15_chapter_retry_no_continue, 0x452817, 7, {
+        if (chapterRetry.noContinue)
+            pCtx->Eip = 0x452820;
+    })
     EHOOK_DY(th15_inf_lives, 0x456397,1,
     {
-        if ((*(THOverlay::singleton().mInfLives))) {
+        if (!ChapterLivesEnabled() && *THOverlay::singleton().mInfLives) {
             if (!g_adv_igi_options.map_inf_life_to_no_continue) {
                 pCtx->Eax++;
             } else {
@@ -2523,6 +2598,7 @@ namespace TH15 {
         *((int32_t*)0x4e7410) = *((int32_t*)0x4e0ef4);
     })
     EHOOK_DY(th15_patch_main, 0x43c68c, 1, {
+        chapterRetry = {};
         th15_chapter_set.Disable();
         th15_chapter_disable.Disable();
         th15_stars_bgm_sync.Disable();
@@ -2690,8 +2766,9 @@ namespace TH15 {
     })
     EHOOK_DY(th15_life_dec, 0x456398,5, // life dec
     {
-       TH15InGameInfo::singleton().mMissCount++;
-       FastRetry(thPracParam.mode);
+        TH15InGameInfo::singleton().mMissCount++;
+        if (!chapterRetry.pending && !chapterRetry.noContinue)
+            FastRetry(thPracParam.mode);
     })
     EHOOK_DY(th15_lock_timer1, 0x43404A,10, // initialize
     {

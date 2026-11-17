@@ -74,9 +74,9 @@ void GameUpdateOuter(ImDrawList* p, [[maybe_unused]] int ver)
     }
 }
 
-void FastRetry(int thprac_mode)
+void FastRetry(int thprac_mode, bool force)
 {
-    if (thprac_mode && g_fast_re_opt.enable_fast_retry) {
+    if (force || (thprac_mode && g_fast_re_opt.enable_fast_retry)) {
         g_fast_re_opt.fast_retry_count_down = g_fast_re_opt.fast_retry_cout_down_max;
     }
 }
@@ -822,8 +822,6 @@ void OILPInit(adv_opt_ctx& ctx)
         ctx.fps_replay_fast = oilp_get_replay_skip_fps();
     if (oilp_get_replay_slow_fps)
         ctx.fps_replay_slow = oilp_get_replay_slow_fps();
-
-    ctx.oilp_set_renderer = (adv_opt_ctx::oilp_set_renderer_t*)GetProcAddress((HMODULE)ctx.vpatch_base, "oilp_set_renderer");
 }
 
 void CenteredText(const char* text, float wndX)

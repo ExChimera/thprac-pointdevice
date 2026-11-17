@@ -633,6 +633,8 @@ namespace Gui {
     protected:
         bool OnWidgetUpdate();
     public:
+        static ImVec4 EnabledTextColor() { return { 0.0f, 1.0f, 0.0f, 1.0f }; }
+
         GuiHotKey(th_glossary_t text_ref, const char* key_text, int vkey, HookSlice hooks)
             : mTextRef(text_ref)
             , mKeyText(key_text)

@@ -506,7 +506,7 @@ namespace THPrac
             std::string realText;
             if (mStatus) {
                 realText = std::format("[{}: {}]", mKeyText, text);
-                ImGui::PushStyleColor(ImGuiCol_Text, { 0.0f, 1.0f, 0.0f, 1.0f });
+                ImGui::PushStyleColor(ImGuiCol_Text, EnabledTextColor());
             } else {
                 realText = std::format("{}: {}", mKeyText, text);
             }
